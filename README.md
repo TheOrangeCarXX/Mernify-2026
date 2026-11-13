@@ -3,20 +3,20 @@
 > **MERNIFY Hackathon 2026** — *High-Throughput Streams & Telemetry Track*  
 > Built with **MongoDB, Express.js, React.js, Node.js, and Socket.IO**.
 
-Floodline is a production-grade, real-time telemetry monitoring console and supervisory control system engineered for six distributed stormwater pump stations. When severe weather hits, operators must immediately identify which pump station is in distress, distinguish rising retention basin levels (flooding risk) from pump mechanical faults (vibration/motor current overload), and review historical incident progression without interrupting live surveillance.
+Floodline is a real-time telemetry monitoring console and supervisory control system engineered for six distributed stormwater pump stations. When severe weather hits, operators must immediately identify which pump station is in distress, distinguish rising retention basin levels (flooding risk) from pump mechanical faults (vibration/motor current overload), and review historical incident progression without interrupting live surveillance.
 
 ---
 
 ## Key Features
 
 1. **High-Throughput Ingestion & 16,000-Event Backpressure**:
-   - Continuous simulation streaming **288 readings/second** across six stations (48 Hz per station), tested up to **6,000 readings/second**.
+   - Continuous simulation streaming **288 readings/second** across six stations (48 Hz per station), with an adjustable simulator target.
    - Authenticated external ingestion (`POST /api/ingest`) secured by an Agent Bearer key or Operator session.
    - Bounded in-memory FIFO write queue (16,000 capacity). Overloaded queues return retryable `HTTP 503 Service Unavailable`.
    - Token-bucket rate limiting (requests/s and event volume/s) returning `HTTP 429 Too Many Requests`.
 
-2. **MongoDB Bulk Upserts & Fault Classification**:
-   - 100 ms flush cadence executing bulk upserts (`$setOnInsert`) with compound unique index `{ stationId: 1, eventId: 1 }`. Retried event IDs are completely idempotent.
+2. **MongoDB Bulk Inserts & Fault Classification**:
+   - 100 ms flush cadence executing unordered bulk inserts with compound unique index `{ stationId: 1, eventId: 1 }`. Retried event IDs are completely idempotent.
    - Monotonic commit sequence (`seq`) and 7-day TTL retention index.
    - **Timestamp first, sequence second** evaluation: late-arriving samples update historical records without rolling back the latest station health.
    - Distinguishes **Storm Surge** (high water level), **Intake Blockage** (high water + collapsed outflow), and **Pump Motor Overload** (high vibration / overcurrent).
@@ -32,7 +32,7 @@ Floodline is a production-grade, real-time telemetry monitoring console and supe
    - **Interactive Basin Schematic**: SVG diagram showing catchment topology, water flow paths, live water level indicators, and clickable station nodes.
    - **High-Performance Canvas Telemetry Plot**: Multi-channel rendering (Water Level, Outflow, Vibration, Current) with threshold guide lines, anomaly highlight bands, and interactive crosshair scrubbing.
    - **Incident Timeline**: Historical alert episodes with one-click replay locking the chart to the incident period.
-   - **Client Throttling (4 Hz)**: Chart repaints are throttled to 250 ms, keeping browser CPU usage below 3%.
+   - **Client Throttling (4 Hz)**: Chart repaints are throttled to 250 ms, reducing rendering work.
    - **Mobile SCADA Viewport**: Fully responsive on **390px** mobile viewports for on-call field operators.
 
 ---
@@ -75,7 +75,7 @@ docker compose up -d --wait mongo
 
 ### 2. Install Dependencies & Build Frontend
 ```sh
-npm install
+npm ci
 npm run build
 ```
 
@@ -84,7 +84,7 @@ npm run build
 # Run 6 unit tests (validation, rate limiting, anomaly classification, packing, merge, security)
 npm test
 
-# Run 6 MongoDB integration tests (access control, room isolation, retries, late readings, backfill, restart)
+# Run MongoDB integration tests (access control, room isolation, retries, late readings, backfill, restart)
 npm run test:integration
 ```
 
@@ -93,8 +93,8 @@ npm run test:integration
 # 48 clients, 3,000 readings/s target (Headline Run)
 npm run bench -- --rate=3000 --seconds=30 --clients=48
 
-# 96 clients, 6,000 readings/s target (Stress Run)
-npm run bench -- --rate=6000 --seconds=30 --clients=96
+# 96 clients, 5,000 readings/s target (Stress Run)
+npm run bench -- --rate=5000 --seconds=30 --clients=96
 ```
 
 ### 5. Start Application
@@ -102,6 +102,11 @@ npm run bench -- --rate=6000 --seconds=30 --clients=96
 npm start
 ```
 Open **`http://localhost:3000`** in your browser.
+
+Run `npm run browser-check` after building to verify station isolation, faults, replay, reconnect, and the 390px dashboard in Edge or Chrome. The browser check and benchmark use temporary databases. Use `MONGO_URI` to select your MongoDB instance.
+
+For the live demo, open [Canal Junction](http://localhost:3000/?station=canal-junction) and [East Sluice](http://localhost:3000/?station=east-sluice) in two windows. Trigger **Storm Surge** at Canal Junction. East Sluice keeps its own chart while the fleet counter registers the critical station. Use **Replay** to review the incident and **CSV** to download raw readings. Use **Diagnostics → Test Reconnect** to show history recovering after a disconnect. Watch the [3:24 demo](docs/floodline-demo.mp4) or follow the [demo script](docs/demo-script.md).
+
 
 ---
 
@@ -111,10 +116,10 @@ Conducted on a single Windows host against MongoDB Community 8.0 over loopback i
 
 | Run | Persisted | Deliveries Received | Measured Throughput | p95 Latency |
 |---|---|---|---|---|
-| **48 clients, 3,000 rps (30s)** | 90,000 / 90,000 | 720,000 / 720,000 | **3,000 readings/s** | **183 ms** |
-| **96 clients, 6,000 rps (30s)** | 180,000 / 180,000 | 2,880,000 / 2,880,000 | **5,801 readings/s** | **1,434 ms** |
+| **48 clients, 3,000 rps (30s)** | 90,000 / 90,000 | 720,000 / 720,000 | **2,986 readings/s** | **184 ms** |
+| **96 clients, 5,000 rps (30s)** | 150,000 / 150,000 | 2,400,000 / 2,400,000 | **4,983 readings/s** | **236 ms** |
 
-*Zero missed, duplicate, or misrouted deliveries across both runs.*
+Zero missed, duplicate, or misrouted deliveries across both runs. See [benchmark methodology](docs/benchmark.md).
 
 ---
 
@@ -143,6 +148,7 @@ Conducted on a single Windows host against MongoDB Community 8.0 over loopback i
 - **Viewer**: `viewer` / `viewer123` (Read-only observation and history review)
 - **Agent Bearer Key**: `floodline-agent-key-2026`
 - *Note: In demo mode (`DEMO_MODE=true`, default), visiting the web console automatically assigns an Operator session for seamless judging.*
+- Set `DEMO_MODE=false` to require browser sign-in and authenticated Socket.IO sessions. Configure `JWT_SECRET`, `AGENT_BEARER_KEY`, `OPERATOR_PASSWORD`, and `VIEWER_PASSWORD` before sharing an instance. Set `COOKIE_SECURE=true` behind HTTPS.
 
 ---
 

@@ -1,53 +1,21 @@
-# Floodline Performance Benchmark Report
+# Floodline benchmark results
 
-This document reports high-throughput ingestion and real-time delivery benchmarks conducted on the Floodline MERN + Socket.IO platform.
+These runs used the updated bulk insert pipeline on one Windows host with MongoDB Community 8.0.17 and Node.js 22.17.1. The HTTP driver, server, and WebSocket subscribers ran in one Node process over loopback. MongoDB ran separately.
 
----
+| 30-second offered load | Readings attempted / persisted | Client deliveries received / expected | Measured rate | Socket p50 / p95 / p99 |
+| --- | ---: | ---: | ---: | ---: |
+| 3,000 readings/s, 48 clients | 90,000 / 90,000 | 720,000 / 720,000 | 2,986 readings/s | 116 / 184 / 216 ms |
+| 5,000 readings/s, 96 clients | 150,000 / 150,000 | 2,400,000 / 2,400,000 | 4,983 readings/s | 151 / 236 / 276 ms |
 
-## 1. Test Methodology & Environment
+Both runs recorded zero rejected events, duplicates, misrouted deliveries, or out-of-order sequences. A repeat of the 96-client run delivered all 2,400,000 updates again at 4,981 readings/s and 254 ms p95. Throughput includes the time to the last HTTP acknowledgment. Socket latency runs from event creation to subscriber receipt. A delivery means one reading received by one client. A Socket.IO packet can carry many readings. Browser rendering and WAN latency are outside this measurement.
 
-- **Host Environment**: Windows 11 64-bit, AMD / Intel Multi-core Processor
-- **Database**: MongoDB Community 8.0 Server (Local loopback, port 27017)
-- **Runtime**: Node.js v25.3.0
-- **Network Interface**: Loopback Pseudo-Interface 1 (127.0.0.1)
-- **Ingestion Harness**: `scripts/benchmark.mjs`
-- **Socket.IO Delivery**: Real WebSocket transport over Socket.IO client connections distributed evenly across the 6 pump stations.
+Before the bulk insert change, the 3,000 reading/s run attempted 90,000 readings, persisted 78,600, rejected 11,400, and measured 7,501 ms p95. MongoDB's uniqueness index continues to enforce one reading per station and event ID. The integration test checks that retries report duplicates.
 
----
+With MongoDB running, use a database account that can create and drop the harness's temporary databases.
 
-## 2. Benchmark Results Summary
+```sh
+npm run bench -- --rate=3000 --seconds=30 --clients=48
+npm run bench -- --rate=5000 --seconds=30 --clients=96
+```
 
-| Metric | Headline Run (48 Clients) | Stress Run (96 Clients) |
-|---|---|---|
-| **Target Ingest Rate** | 3,000 readings/s | 6,000 readings/s |
-| **Duration** | 30.0 seconds | 30.0 seconds |
-| **Connected Socket Clients** | 48 subscribers | 96 subscribers |
-| **Total Telemetry Ingested** | 90,000 readings | 180,000 readings |
-| **Total Events Persisted** | **90,000 / 90,000 (100%)** | **180,000 / 180,000 (100%)** |
-| **Duplicate / Dropped Events** | **0 (0.00%)** | **0 (0.00%)** |
-| **Total Client Deliveries** | **720,000 / 720,000** | **2,880,000 / 2,880,000** |
-| **Measured Throughput** | **3,000 readings/s** | **5,801 readings/s** |
-| **Socket Latency p50 (Median)** | 118 ms | 480 ms |
-| **Socket Latency p90** | 165 ms | 1,120 ms |
-| **Socket Latency p95** | **183 ms** | **1,434 ms** |
-| **Socket Latency p99** | 225 ms | 2,150 ms |
-
----
-
-## 3. Analysis of Bottlenecks and Performance Characteristics
-
-1. **Headline Run (3,000 readings/s, 48 clients)**:
-   - Persisted **90,000 readings** in 30 seconds with **zero missed or duplicate events**.
-   - Socket.IO broadcast fanout delivered **720,000 total messages** to 48 clients.
-   - P95 latency was **183 ms**, which encompasses ingestion validation, 100ms batch flush queue cadence, MongoDB bulk upsert write, and WebSocket frame transmission.
-
-2. **Stress Run (6,000 readings/s, 96 clients)**:
-   - Measured throughput reached **5,801 readings/s**.
-   - Total deliveries exceeded **2.88 million events** across 96 concurrent clients.
-   - P95 latency increased to **1,434 ms**. This latency growth was caused by single-process Node event loop saturation handling JSON serialization and WebSocket frame generation under 2.88M deliveries.
-   - MongoDB disk I/O remained healthy with bulk writes averaging 2,000 documents per batch.
-
-3. **Key Optimization Takeaways**:
-   - **Compact Encoding**: Using array serialization `[stationId, eventId, timestamp, seq, ...]` reduced bandwidth by 62% compared to verbose JSON objects.
-   - **Station Room Isolation**: Partitioning broadcast by station rooms eliminated 83% of unnecessary WebSocket deliveries per client.
-   - **Client Throttling (4 Hz)**: Limiting client canvas repaints to 250ms kept operator browser CPU below 3% under all test conditions.
+The harness starts a separate server and database, confirms subscriptions before sending traffic, compares acknowledged and persisted counts, and checks each client's expected deliveries. A mismatch produces a nonzero exit code.

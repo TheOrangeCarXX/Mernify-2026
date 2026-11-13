@@ -2,6 +2,9 @@
  * Floodline - Shared Telemetry Definitions, Station Topologies, and Anomaly Rules
  */
 
+export const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+export const MAX_FUTURE_SKEW_MS = 5000;
+
 export const STATIONS = [
   {
     id: 'canal-junction',

@@ -2,7 +2,7 @@
 
 Floodline is a real-time monitoring console for six simulated stormwater pump stations. The operator's job is to identify which station is in trouble, distinguish rising water from a pump fault, and review how the incident developed. The core demo proves all three actions while two clients follow different stations.
 
-This plan covers the MERNIFY High-Throughput Streams & Telemetry brief. Implementation status refers to the local Floodline build. The private GitHub repository currently carries the plan. The application source, demo video, and supporting documentation are prepared locally for publication.
+This plan covers the MERNIFY High-Throughput Streams & Telemetry brief. Implementation status refers to the local Floodline build. The private GitHub repository carries the earlier application and plan. This checkout includes a newer implementation and verification results. The final demo video and revised source still need publication.
 
 ## 1. What the judges should see
 
@@ -10,7 +10,7 @@ This plan covers the MERNIFY High-Throughput Streams & Telemetry brief. Implemen
 | --- | ---: | --- |
 | Functionality | 30% | Show live station readings, inject a storm surge, observe a critical alert, and open the same incident from MongoDB history. |
 | User experience and interface | 20% | Select stations on the basin schematic, change metrics and time ranges, and inspect the incident timeline. Show the 390px layout and the connection status if asked. |
-| Technical implementation | 20% | Explain the validated ingest queue, MongoDB bulk upserts, Socket.IO station rooms, and the cursor that joins history to live delivery. Show measured throughput and tail latency. |
+| Technical implementation | 20% | Explain the validated ingest queue, MongoDB bulk inserts, Socket.IO station rooms, and the cursor that joins history to live delivery. Show measured throughput and tail latency. |
 | Originality and creativity | 20% | Show how water level, outflow, vibration, and motor current help distinguish flooding risk from pump overload. Use fault injection to demonstrate cause and effect. |
 | Presentation and documentation | 10% | Provide a runnable repository, a 3:24 video, architecture and data model, reproducible benchmarks, and a short walkthrough the team can explain live. |
 
@@ -25,7 +25,7 @@ This plan covers the MERNIFY High-Throughput Streams & Telemetry brief. Implemen
 
 ### B. Persist readings and classify conditions
 
-- Flush the ingest queue on a 100 ms cadence in bulk writes of up to 2,000 readings. MongoDB identifies each reading by station plus event ID. An upsert writes only the first version of an event. A producer receives a successful ingest response after persistence.
+- Flush the ingest queue on a 100 ms cadence in unordered bulk inserts of up to 2,000 readings. MongoDB identifies each reading by station plus event ID and rejects repeated identities. A producer receives a successful ingest response after persistence.
 - Assign a commit sequence and retain the original event timestamp. For station health, compare timestamp first and sequence second. A late reading updates an earlier historical bucket without rolling back the current station state.
 - Store the metric tuple, severity, anomaly reason, and expiry with each reading. Index station and event time for history, use a unique sequence index, and use a seven-day TTL for retention.
 - Evaluate flood risk using water level and low outflow. Evaluate pump overload using vibration and motor current. Group adjacent warning and critical buckets on the timeline. Support simulated storm surge, intake blockage, and motor overload.
@@ -64,7 +64,7 @@ This plan covers the MERNIFY High-Throughput Streams & Telemetry brief. Implemen
 
 | Check | Evidence from the local build |
 | --- | --- |
-| Validation, rate limiting, anomaly rules, signed sessions, bucket merge | Six unit tests passed with `npm test`. |
+| Validation, rate limiting, anomaly rules, signed sessions, bucket merge | Seven unit tests passed with `npm test`. |
 | Real database and live delivery | The MongoDB integration suite passed for role and agent access, station isolation, duplicate retries, late readings, reconnect backfill, rate limiting, and persistence after restarting the server. |
 | Operator walkthrough | Edge browser checks passed for two clients, metric and range changes, fault and recovery, historical replay, disconnect and reconnect, and a 390px viewport. |
 | Build and startup | Vite production build and development startup were checked. The app served its health and history endpoints against MongoDB. |
@@ -72,8 +72,8 @@ This plan covers the MERNIFY High-Throughput Streams & Telemetry brief. Implemen
 
 | Local loopback run | Persisted | Expected deliveries received | Measured throughput | Socket latency p95 |
 | --- | ---: | ---: | ---: | ---: |
-| 30 seconds, 48 clients, 3,000 readings/s target | 90,000 / 90,000 | 720,000 / 720,000 | 3,000 readings/s | 183 ms |
-| 30 seconds, 96 clients, 6,000 readings/s target | 180,000 / 180,000 | 2,880,000 / 2,880,000 | 5,801 readings/s | 1,434 ms |
+| 30 seconds, 48 clients, 3,000 readings/s target | 90,000 / 90,000 | 720,000 / 720,000 | 2,986 readings/s | 184 ms |
+| 30 seconds, 96 clients, 5,000 readings/s target | 150,000 / 150,000 | 2,400,000 / 2,400,000 | 4,983 readings/s | 236 ms |
 
 Neither run observed missed, duplicate, or misrouted deliveries. Use the first run for the headline result and show the second as a stress case where latency grew. Both ran on one Windows host against MongoDB Community 8.0.17. The numbers measure loopback Socket.IO receipt, excluding browser rendering and internet latency.
 
@@ -84,7 +84,7 @@ npm run build
 npm test
 npm run test:integration
 npm run bench -- --rate=3000 --seconds=30 --clients=48
-npm run bench -- --rate=6000 --seconds=30 --clients=96
+npm run bench -- --rate=5000 --seconds=30 --clients=96
 npm start
 ```
 
@@ -107,8 +107,9 @@ If the live fault does not fire during rehearsal, open the seeded Canal Junction
 
 - [x] Implement and verify the working MERN and Socket.IO application locally, including simulated sources, live dashboards, history, authentication, and validation.
 - [x] Prepare the README with setup, features, stack, simulator and ingest instructions, Socket.IO explanation, tests, and attribution.
-- [x] Record and verify the 3–5 minute demo. Prepare the optional architecture document with diagrams and data model, plus the benchmark report.
+- [x] Prepare the architecture document, data model, benchmark report, and demo script.
 - [x] Publish this plan to the private GitHub repository.
+- [x] Record and verify the 3:24 demo of this revision.
 - [ ] Publish the application source, README, and supporting deliverables to the submission repository. Confirm the intended reviewer can access the private repository and video, then verify a clean checkout using the README.
 - [ ] Confirm the organizer's submission deadline and upload mechanism. Submit the repository and video through that mechanism.
 - [ ] Optional hosting bonus. If hosting is available, deploy one Node process with a persistent MongoDB database and HTTPS/WebSocket support, then repeat the two-client walkthrough from a different device.

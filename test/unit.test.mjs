@@ -192,6 +192,32 @@ test('5. Series Manager: merges MongoDB history and Socket.IO live stream withou
   assert.equal(latestState.points.length, 3);
 });
 
+test('Live buckets merge late updates into history and preserve the latest reading', () => {
+  const now = Date.now();
+  const origin = now - 1000;
+  const stationId = 'canal-junction';
+  const make = (seq, timestamp, waterLevel) => ({
+    seq, stationId, timestamp, eventId: 'bucket-' + seq,
+    metrics: { waterLevel, outflow: 600, vibration: 2, current: 45 },
+    severity: waterLevel > 3 ? 'critical' : 'normal'
+  });
+  const series = new TelemetrySeriesManager();
+  series.startStationSubscription(stationId, 10);
+  series.setLiveResolution(1000, origin);
+  series.applyHistory([{
+    ...make(10, origin, 2), isBucket: true, count: 2,
+    last: make(10, now - 50, 2.5)
+  }]);
+  series.ingestLive(make(11, now - 100, 4));
+  series.ingestLive(make(11, now - 100, 4));
+  const bucket = series.liveBuckets.get(origin);
+  assert.equal(bucket.count, 3);
+  assert.equal(bucket.severity, 'critical');
+  assert.equal(series.getMetricsSummary().waterLevel.current, 2.5);
+  assert.equal(series.getMetricsSummary().waterLevel.max, 4);
+  assert.equal(series.liveBuckets.size, 1);
+});
+
 // Test 6: Signed Sessions and Role-Based Access Control
 test('6. Security: validates JWT sessions, roles, and agent bearer tokens', () => {
   // Generate and verify operator token

@@ -1,6 +1,6 @@
 # Floodline SCADA System Architecture & Design Document
 
-Floodline is a high-throughput real-time telemetry monitoring and supervisory control platform engineered for stormwater pump stations. It models continuous multi-channel sensor feeds, validates and persists incoming high-frequency streams into MongoDB via bounded bulk upserts, and distributes low-latency selective updates to operators using Socket.IO.
+Floodline is a high-throughput real-time telemetry monitoring and supervisory control platform engineered for stormwater pump stations. It models continuous multi-channel sensor feeds, validates and persists incoming high-frequency streams into MongoDB via bounded bulk inserts, and distributes low-latency selective updates to operators using Socket.IO.
 
 ---
 
@@ -9,14 +9,14 @@ Floodline is a high-throughput real-time telemetry monitoring and supervisory co
 ```mermaid
 flowchart TD
     subgraph Ingestion["Ingestion Layer"]
-        A1["Virtual Telemetry Simulator<br/>(288 - 6,000 readings/s)"] -->|Internal Stream| Q["Bounded Ingest Queue<br/>(Capacity: 16,000 events)"]
+        A1["Virtual Telemetry Simulator<br/>(288 readings/s default)"] -->|Internal Stream| Q["Bounded Ingest Queue<br/>(Capacity: 16,000 events)"]
         A2["External Ingest Agents<br/>(POST /api/ingest)"] -->|Bearer Auth & Rate Limit| Q
     end
 
     subgraph Processing["Processing & Storage Engine"]
         Q -->|100ms Batch Drain<br/>(Up to 2,000 ev)| P["Condition Classifier<br/>& Anomaly Engine"]
         P -->|Atomic Sequence Assignment| S["Monotonic Sequence Counter<br/>(latestSeq)"]
-        P -->|Bulk Upsert<br/>$setOnInsert| DB[("MongoDB Community<br/>readings / station_state / incidents")]
+        P -->|Unordered Bulk Insert| DB[("MongoDB Community<br/>readings / station_state / incidents")]
     end
 
     subgraph Distribution["Real-Time Distribution Engine"]
@@ -43,35 +43,14 @@ flowchart TD
 1. **Bounded Queue**: Ingest requests are placed into an in-memory FIFO queue bounded at **16,000 events**.
 2. **Backpressure (503 Service Unavailable)**: When the queue reaches 16,000 events, incoming HTTP requests receive an immediate `HTTP 503 Service Unavailable` with `Retry-After: 1`. Producers retry with their stable event IDs.
 3. **Rate Limiting (429 Too Many Requests)**: Protected by a Token Bucket algorithm limiting both request frequency (50 req/s burst up to 200) and event volume (5,000 events/s burst up to 10,000).
-4. **Cadence Flush**: Every **100 ms**, the engine drains up to **2,000 events** from the queue and executes an asynchronous MongoDB `bulkWrite`.
+4. **Cadence Flush**: Every **100 ms**, the engine drains up to **2,000 events** from the queue and executes MongoDB `insertMany` with unordered writes.
 
-### B. MongoDB Bulk Upserts & Deduplication
+### B. MongoDB Bulk Inserts & Deduplication
 To guarantee idempotency and avoid duplicate entries during retries or network replays:
 - Each event carries a stable `stationId` and `eventId`.
-- MongoDB executes:
-```javascript
-readingsCollection.bulkWrite([
-  {
-    updateOne: {
-      filter: { stationId: ev.stationId, eventId: ev.eventId },
-      update: {
-        $setOnInsert: {
-          stationId: ev.stationId,
-          eventId: ev.eventId,
-          timestamp: ev.timestamp,
-          seq: nextSeq(),
-          metrics: ev.metrics,
-          severity: classification.severity,
-          anomalyReason: classification.anomalyReason,
-          expireAt: new Date(ev.timestamp + 7 * 24 * 3600 * 1000)
-        }
-      },
-      upsert: true
-    }
-  }
-], { ordered: false });
-```
-- Only newly upserted readings increment the stored counter and trigger real-time live Socket.IO delivery. Duplicate submissions return `duplicates: 1` and do not generate duplicate client broadcasts.
+- Deduplicate repeated identities inside each flush and insert the remaining readings in one unordered MongoDB call. The compound unique index rejects identities already stored. Map inserted counts back to the individual HTTP requests.
+- Publish inserts to the corresponding station room after MongoDB confirms them. The sequence in a subscription acknowledgment tracks committed readings. A retryable failure directs the agent to reuse its event IDs.
+- Keep the latest station state ordered by event timestamp, then sequence. Write incident updates once per flush and recover unresolved incidents on restart.
 
 ---
 
@@ -100,7 +79,7 @@ interface ReadingDocument {
 
 **Indexes:**
 - `{ stationId: 1, eventId: 1 }` (unique, deduplication)
-- `{ stationId: 1, timestamp: 1 }` (fast historical range retrieval)
+- `{ stationId: 1, timestamp: 1, seq: 1 }` (fast historical range retrieval)
 - `{ seq: 1 }` (unique, cursor handshake backfill)
 - `{ expireAt: 1 }` with `{ expireAfterSeconds: 0 }` (automated TTL retention)
 
@@ -183,6 +162,6 @@ sequenceDiagram
 1. **Station Room Isolation**: Clients subscribe only to the station they are actively monitoring (`station:${stationId}`). Live 48-1000 Hz telemetry for Station A is never transmitted over WebSocket to clients monitoring Station B.
 2. **Compact Array Encoding**: High-frequency telemetry packets are serialized into compact numeric arrays instead of repetitive JSON keys:
    `[stationId, eventId, timestamp, seq, waterLevel, outflow, vibration, current, severity, anomalyReason]`
-   This reduces payload size by ~62% and cuts JSON serialization/deserialization CPU overhead.
+   The tuple avoids repeating field names per reading.
 3. **Fleet Summary Broadcast**: A decoupled 1 Hz summary packet is broadcast globally to all connected clients, carrying network-wide health and active alerts. An operator monitoring Canal Junction immediately sees an alert beacon on East Sluice.
-4. **Client-Side Rendering Throttling**: The browser UI throttles canvas rendering to a maximum of **4 Hz (250 ms)** using an internal dirty flag, keeping browser CPU below 3% even when receiving 288+ updates per second.
+4. **Client-Side Rendering Throttling**: The browser UI throttles canvas rendering to a maximum of **4 Hz (250 ms)** using an internal dirty flag, while merging live rows into the same time buckets returned by MongoDB.

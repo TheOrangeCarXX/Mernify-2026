@@ -3,12 +3,12 @@
  */
 
 import { MongoClient } from 'mongodb';
-import { STATIONS, classifyTelemetry } from '../shared/telemetry.mjs';
+import { RETENTION_MS, STATIONS, classifyTelemetry } from '../shared/telemetry.mjs';
 
 export const MAX_QUEUE_SIZE = 16000;
 export const FLUSH_INTERVAL_MS = 100;
 export const MAX_FLUSH_BATCH = 2000;
-export const TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+export const TTL_SECONDS = RETENTION_MS / 1000;
 
 export class TelemetryStore {
   constructor(mongoUri = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/floodline') {
@@ -21,17 +21,22 @@ export class TelemetryStore {
 
     // In-memory queue for backpressure and bulk writes
     this.queue = [];
+    this.pendingEvents = 0;
+    this.activeFlush = null;
+    this.closing = false;
+    this.lastWriteFailed = false;
     this.flushTimer = null;
-    this.isFlushing = false;
 
     // Monotonic commit sequence
     this.currentSeq = 0;
+    this.nextSeq = 0;
 
     // Station latest states: stationId -> { timestamp, seq, metrics, severity, anomalyReason }
     this.stationStates = new Map();
 
     // Active incidents: stationId -> incident object
     this.activeIncidents = new Map();
+    this.dirtyIncidents = new Map();
 
     // Callback when items are committed (for Socket.IO broadcasting)
     this.onCommitted = null;
@@ -41,7 +46,8 @@ export class TelemetryStore {
     this.client = new MongoClient(this.mongoUri, {
       maxPoolSize: 50,
       minPoolSize: 10,
-      serverSelectionTimeoutMS: 5000
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 5000
     });
     await this.client.connect();
     this.db = this.client.db();
@@ -58,11 +64,13 @@ export class TelemetryStore {
   }
 
   async close() {
+    this.closing = true;
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
     }
-    await this._flushQueue(); // Final flush
+    await this.activeFlush;
+    while (this.queue.length) await this._flushQueue();
     if (this.client) {
       await this.client.close();
       this.client = null;
@@ -74,7 +82,7 @@ export class TelemetryStore {
     await this.readingsCol.createIndex({ stationId: 1, eventId: 1 }, { unique: true });
 
     // Compound index for historical queries
-    await this.readingsCol.createIndex({ stationId: 1, timestamp: 1 });
+    await this.readingsCol.createIndex({ stationId: 1, timestamp: 1, seq: 1 });
 
     // Unique index on monotonic sequence
     await this.readingsCol.createIndex({ seq: 1 }, { unique: true });
@@ -88,6 +96,7 @@ export class TelemetryStore {
     // Incidents indexes
     await this.incidentsCol.createIndex({ incidentId: 1 }, { unique: true });
     await this.incidentsCol.createIndex({ stationId: 1, startTime: 1 });
+    await this.incidentsCol.createIndex({ resolved: 1, startTime: 1 });
   }
 
   async _initializeSequenceAndState() {
@@ -108,12 +117,24 @@ export class TelemetryStore {
       });
     }
 
+    // Readings are authoritative if the process stopped before state was written.
+    const latest = await Promise.all(STATIONS.map(station =>
+      this.readingsCol.findOne({ stationId: station.id }, { sort: { timestamp: -1, seq: -1 } })
+    ));
+    for (const reading of latest) if (reading) this._updateStationState(reading);
+    for (const state of this.stationStates.values()) {
+      this.currentSeq = Math.max(this.currentSeq, state.seq);
+    }
+    this.nextSeq = this.currentSeq;
+    const active = await this.incidentsCol.find({ resolved: false }).sort({ startTime: 1 }).toArray();
+    for (const incident of active) this.activeIncidents.set(incident.stationId, incident);
+
     // Initialize default states for stations not yet in database
     for (const station of STATIONS) {
       if (!this.stationStates.has(station.id)) {
         const defaultState = {
           stationId: station.id,
-          timestamp: Date.now(),
+          timestamp: 0,
           seq: this.currentSeq,
           metrics: {
             waterLevel: (station.nominalWaterLevel.min + station.nominalWaterLevel.max) / 2,
@@ -134,7 +155,7 @@ export class TelemetryStore {
   }
 
   getQueueLength() {
-    return this.queue.length;
+    return this.pendingEvents;
   }
 
   getStationState(stationId) {
@@ -151,13 +172,15 @@ export class TelemetryStore {
    * Returns a promise that resolves once the batch is flushed and persisted.
    */
   enqueueBatch(events) {
-    if (this.queue.length + events.length > MAX_QUEUE_SIZE) {
+    if (!events.length) return Promise.resolve({ stored: 0, duplicates: 0, latestSeq: this.currentSeq });
+    if (this.closing || events.length > MAX_FLUSH_BATCH || this.pendingEvents + events.length > MAX_QUEUE_SIZE) {
       const err = new Error('Ingest write queue saturated (backpressure limit 16,000 exceeded). Retry shortly.');
       err.code = 'QUEUE_OVERLOAD';
       return Promise.reject(err);
     }
 
     return new Promise((resolve, reject) => {
+      this.pendingEvents += events.length;
       this.queue.push({
         events,
         resolve,
@@ -167,31 +190,35 @@ export class TelemetryStore {
     });
   }
 
-  async _flushQueue() {
-    if (this.isFlushing || this.queue.length === 0) return;
-    this.isFlushing = true;
+  _flushQueue() {
+    if (this.activeFlush || !this.queue.length) return this.activeFlush;
+    this.activeFlush = this._persistQueuedBatches().finally(() => { this.activeFlush = null; });
+    return this.activeFlush;
+  }
+
+  async _persistQueuedBatches() {
+    const accumulatedEvents = [];
+    const pendingBatches = [];
 
     try {
-      let accumulatedEvents = [];
-      const pendingBatches = [];
-
       // Drain up to MAX_FLUSH_BATCH events from waiting items
-      while (this.queue.length > 0 && accumulatedEvents.length < MAX_FLUSH_BATCH) {
+      while (this.queue.length &&
+          accumulatedEvents.length + this.queue[0].events.length <= MAX_FLUSH_BATCH) {
         const item = this.queue.shift();
         pendingBatches.push(item);
         accumulatedEvents.push(...item.events);
       }
 
-      if (accumulatedEvents.length === 0) {
-        this.isFlushing = false;
-        return;
-      }
-
-      const now = Date.now();
       const preparedDocs = [];
+      const batchIdentities = new Set();
 
       for (const ev of accumulatedEvents) {
-        this.currentSeq += 1;
+        const identity = ev.stationId + ':' + ev.eventId;
+        if (batchIdentities.has(identity)) {
+          preparedDocs.push(null);
+          continue;
+        }
+        batchIdentities.add(identity);
         const classification = classifyTelemetry(ev.metrics, ev.stationId);
         const expireAt = new Date(ev.timestamp + TTL_SECONDS * 1000);
 
@@ -199,7 +226,7 @@ export class TelemetryStore {
           stationId: ev.stationId,
           eventId: ev.eventId,
           timestamp: ev.timestamp,
-          seq: this.currentSeq,
+          seq: ++this.nextSeq,
           metrics: ev.metrics,
           severity: classification.severity,
           anomalyReason: classification.anomalyReason,
@@ -207,49 +234,32 @@ export class TelemetryStore {
         });
       }
 
-      // Perform bulk upsert
-      const bulkOps = preparedDocs.map(doc => ({
-        updateOne: {
-          filter: { stationId: doc.stationId, eventId: doc.eventId },
-          update: { $setOnInsert: doc },
-          upsert: true
+      // The unique event index makes unordered inserts idempotent.
+      const writes = preparedDocs.flatMap((doc, index) => doc ? [{ doc, index }] : []);
+      let insertedIndices;
+      try {
+        const result = await this.readingsCol.insertMany(writes.map(({ doc }) => doc), { ordered: false });
+        insertedIndices = new Set(Object.keys(result.insertedIds).map(index => writes[Number(index)].index));
+      } catch (error) {
+        // A write can fail after MongoDB has committed a subset of the batch.
+        const persisted = await this.readingsCol.find({ seq: { $in: writes.map(({ doc }) => doc.seq) } },
+          { projection: { seq: 1 } }).toArray().catch(() => []);
+        const recovered = new Set(persisted.map(doc => doc.seq));
+        insertedIndices = new Set(writes.filter(({ doc }) => recovered.has(doc.seq)).map(({ index }) => index));
+        const duplicateRetries = Array.isArray(error.writeErrors) && error.writeErrors.length > 0 &&
+          error.writeErrors.every(entry => entry.code === 11000 && /stationId_1_eventId_1/.test(entry.errmsg)) &&
+          !error.result?.getWriteConcernError();
+        if (!duplicateRetries || insertedIndices.size + error.writeErrors.length !== writes.length) {
+          this._publishReadings(preparedDocs.filter((_, index) => insertedIndices.has(index)));
+          await this._persistIncidents();
+          throw error;
         }
-      }));
-
-      const bulkResult = await this.readingsCol.bulkWrite(bulkOps, { ordered: false });
+      }
 
       // Identify newly inserted docs vs duplicates
-      const upsertedIndices = new Set();
-      if (bulkResult.upsertedIds) {
-        for (const idxKey of Object.keys(bulkResult.upsertedIds)) {
-          upsertedIndices.add(Number(idxKey));
-        }
-      }
-
-      const newlyCommittedDocs = [];
-      let storedCount = 0;
-      let duplicateCount = 0;
-
-      for (let i = 0; i < preparedDocs.length; i++) {
-        const doc = preparedDocs[i];
-        const isNew = upsertedIndices.has(i);
-
-        if (isNew) {
-          storedCount++;
-          newlyCommittedDocs.push(doc);
-
-          // Update station state: compare timestamp first, sequence second
-          this._updateStationState(doc);
-          this._processIncidentTracking(doc);
-        } else {
-          duplicateCount++;
-        }
-      }
-
-      // Notify broadcast listener of committed readings
-      if (newlyCommittedDocs.length > 0 && typeof this.onCommitted === 'function') {
-        this.onCommitted(newlyCommittedDocs);
-      }
+      const newlyCommittedDocs = preparedDocs.filter((_, index) => insertedIndices.has(index));
+      this._publishReadings(newlyCommittedDocs);
+      this.lastWriteFailed = false;
 
       // Persist updated station states to DB
       const stateBulk = [];
@@ -262,23 +272,41 @@ export class TelemetryStore {
           }
         });
       }
-      if (stateBulk.length > 0) {
-        await this.stateCol.bulkWrite(stateBulk, { ordered: false });
+      if (newlyCommittedDocs.length) {
+        await this.stateCol.bulkWrite(stateBulk, { ordered: false }).catch(error => {
+          console.error('[Station State Write Error]', error);
+        });
       }
+      await this._persistIncidents();
 
       // Resolve all pending caller promises
+      let offset = 0;
       for (const item of pendingBatches) {
+        const end = offset + item.events.length;
+        let stored = 0;
+        for (; offset < end; offset++) stored += Number(insertedIndices.has(offset));
         item.resolve({
-          stored: storedCount,
-          duplicates: duplicateCount,
+          stored,
+          duplicates: item.events.length - stored,
           latestSeq: this.currentSeq
         });
       }
     } catch (err) {
+      this.lastWriteFailed = true;
       console.error('[Store Flush Error]', err);
+      for (const item of pendingBatches) item.reject(err);
     } finally {
-      this.isFlushing = false;
+      this.pendingEvents -= accumulatedEvents.length;
     }
+  }
+
+  _publishReadings(readings) {
+    if (!readings.length) return;
+    this.currentSeq = Math.max(this.currentSeq, readings.at(-1).seq);
+    for (const doc of readings) {
+      if (this._updateStationState(doc)) this._processIncidentTracking(doc);
+    }
+    this.onCommitted?.(readings);
   }
 
   /**
@@ -297,7 +325,7 @@ export class TelemetryStore {
         severity: doc.severity,
         anomalyReason: doc.anomalyReason
       });
-      return;
+      return true;
     }
 
     // Compare timestamp first, sequence second
@@ -310,7 +338,9 @@ export class TelemetryStore {
         severity: doc.severity,
         anomalyReason: doc.anomalyReason
       });
+      return true;
     }
+    return false;
   }
 
   _processIncidentTracking(doc) {
@@ -331,37 +361,45 @@ export class TelemetryStore {
           resolved: false
         };
         this.activeIncidents.set(doc.stationId, incident);
-        this.incidentsCol.updateOne(
-          { incidentId: incident.incidentId },
-          { $set: incident },
-          { upsert: true }
-        ).catch(() => {});
+        this.dirtyIncidents.set(incident.incidentId, incident);
       } else {
         // Update active incident
         active.endTime = Math.max(active.endTime, doc.timestamp);
         if (doc.severity === 'critical') active.severity = 'critical';
-        if (!active.reasons.includes(doc.anomalyReason)) {
+        if (active.reasons.length < 8 && !active.reasons.includes(doc.anomalyReason)) {
           active.reasons.push(doc.anomalyReason);
         }
         if (doc.metrics.waterLevel > active.peakMetrics.waterLevel) active.peakMetrics.waterLevel = doc.metrics.waterLevel;
+        if (doc.metrics.outflow > active.peakMetrics.outflow) active.peakMetrics.outflow = doc.metrics.outflow;
         if (doc.metrics.vibration > active.peakMetrics.vibration) active.peakMetrics.vibration = doc.metrics.vibration;
         if (doc.metrics.current > active.peakMetrics.current) active.peakMetrics.current = doc.metrics.current;
 
-        this.incidentsCol.updateOne(
-          { incidentId: active.incidentId },
-          { $set: active }
-        ).catch(() => {});
+        this.dirtyIncidents.set(active.incidentId, active);
       }
     } else if (active) {
       // Station returned to normal; close incident after 30 seconds of stability
       if (doc.timestamp - active.endTime > 30000) {
         active.resolved = true;
-        this.incidentsCol.updateOne(
-          { incidentId: active.incidentId },
-          { $set: { resolved: true, endTime: active.endTime } }
-        ).catch(() => {});
+        this.dirtyIncidents.set(active.incidentId, active);
         this.activeIncidents.delete(doc.stationId);
       }
+    }
+  }
+
+  async _persistIncidents() {
+    if (!this.dirtyIncidents.size) return;
+    const updates = [...this.dirtyIncidents.values()].map(({ _id, ...incident }) => ({
+      updateOne: {
+        filter: { incidentId: incident.incidentId },
+        update: { $set: incident },
+        upsert: true
+      }
+    }));
+    try {
+      await this.incidentsCol.bulkWrite(updates, { ordered: false });
+      this.dirtyIncidents.clear();
+    } catch (error) {
+      console.error('[Incident Write Error]', error);
     }
   }
 
@@ -382,13 +420,10 @@ export class TelemetryStore {
       query.seq = { $lte: Number(beforeSeq) };
     }
 
-    const count = await this.readingsCol.countDocuments(query);
-
-    // If points are small enough or bucketing not needed, return sorted raw readings
-    if (count <= maxPoints || !bucketMs) {
+    if (!bucketMs) {
       const readings = await this.readingsCol
         .find(query)
-        .sort({ timestamp: 1 })
+        .sort({ timestamp: 1, seq: 1 })
         .limit(maxPoints * 2)
         .toArray();
 
@@ -404,50 +439,62 @@ export class TelemetryStore {
     }
 
     // Time-bucket aggregation
-    const bMs = Number(bucketMs) || Math.max(500, Math.floor((to - from) / maxPoints));
+    const bMs = Math.max(bucketMs, Math.ceil((to - from + 1) / maxPoints));
 
     const pipeline = [
       { $match: query },
+      { $set: { severityRank: { $indexOfArray: [['normal', 'warning', 'critical'], '$severity'] } } },
       {
         $group: {
           _id: {
-            $subtract: ['$timestamp', { $mod: ['$timestamp', bMs] }]
+            $subtract: ['$timestamp', { $mod: [{ $subtract: ['$timestamp', from] }, bMs] }]
           },
           avgWaterLevel: { $avg: '$metrics.waterLevel' },
-          maxWaterLevel: { $max: '$metrics.waterLevel' },
           avgOutflow: { $avg: '$metrics.outflow' },
           avgVibration: { $avg: '$metrics.vibration' },
-          maxVibration: { $max: '$metrics.vibration' },
           avgCurrent: { $avg: '$metrics.current' },
+          minWaterLevel: { $min: '$metrics.waterLevel' },
+          maxWaterLevel: { $max: '$metrics.waterLevel' },
+          minOutflow: { $min: '$metrics.outflow' },
+          maxOutflow: { $max: '$metrics.outflow' },
+          minVibration: { $min: '$metrics.vibration' },
+          maxVibration: { $max: '$metrics.vibration' },
+          minCurrent: { $min: '$metrics.current' },
+          maxCurrent: { $max: '$metrics.current' },
           maxSeq: { $max: '$seq' },
-          severities: { $push: '$severity' },
-          reasons: { $push: '$anomalyReason' }
+          count: { $sum: 1 },
+          last: { $top: {
+            sortBy: { timestamp: -1, seq: -1 },
+            output: { timestamp: '$timestamp', seq: '$seq', metrics: '$metrics' }
+          } },
+          peak: { $top: {
+            sortBy: { severityRank: -1, timestamp: -1, seq: -1 },
+            output: { severity: '$severity', reason: '$anomalyReason' }
+          } }
         }
       },
       { $sort: { _id: 1 } }
     ];
 
-    const aggregated = await this.readingsCol.aggregate(pipeline).toArray();
+    const aggregated = await this.readingsCol.aggregate(pipeline, { maxTimeMS: 4000 }).toArray();
 
     return aggregated.map(b => {
-      let severity = 'normal';
-      if (b.severities.includes('critical')) severity = 'critical';
-      else if (b.severities.includes('warning')) severity = 'warning';
-
-      const firstNonNormalReason = b.reasons.find(r => r && !r.startsWith('Nominal')) || 'Nominal operating conditions';
-
       return {
         stationId,
         timestamp: b._id,
         seq: b.maxSeq,
+        count: b.count,
+        last: b.last,
+        min: { waterLevel: b.minWaterLevel, outflow: b.minOutflow, vibration: b.minVibration, current: b.minCurrent },
+        max: { waterLevel: b.maxWaterLevel, outflow: b.maxOutflow, vibration: b.maxVibration, current: b.maxCurrent },
         metrics: {
           waterLevel: Number(b.avgWaterLevel.toFixed(3)),
           outflow: Number(b.avgOutflow.toFixed(1)),
           vibration: Number(b.avgVibration.toFixed(2)),
           current: Number(b.avgCurrent.toFixed(1))
         },
-        severity,
-        anomalyReason: firstNonNormalReason,
+        severity: b.peak.severity,
+        anomalyReason: b.peak.reason,
         isBucket: true
       };
     });
@@ -460,6 +507,10 @@ export class TelemetryStore {
       .sort({ startTime: -1 })
       .limit(limit)
       .toArray();
+  }
+
+  async getIncident(incidentId) {
+    return this.incidentsCol.findOne({ incidentId });
   }
 
   /**
@@ -515,7 +566,7 @@ export class TelemetryStore {
     for (let i = 0; i < seededEvents.length; i += 2000) {
       const slice = seededEvents.slice(i, i + 2000);
       const bulkOps = slice.map(ev => {
-        this.currentSeq += 1;
+        this.nextSeq += 1;
         const cls = classifyTelemetry(ev.metrics, ev.stationId);
         return {
           updateOne: {
@@ -525,7 +576,7 @@ export class TelemetryStore {
                 stationId: ev.stationId,
                 eventId: ev.eventId,
                 timestamp: ev.timestamp,
-                seq: this.currentSeq,
+              seq: this.nextSeq,
                 metrics: ev.metrics,
                 severity: cls.severity,
                 anomalyReason: cls.anomalyReason,
@@ -537,6 +588,7 @@ export class TelemetryStore {
         };
       });
       await this.readingsCol.bulkWrite(bulkOps, { ordered: false });
+      this.currentSeq = this.nextSeq;
     }
 
     // Seed the archived Canal Junction Incident record

@@ -4,7 +4,10 @@
  * and fault injection capabilities (Storm Surge, Intake Blockage, Motor Overload).
  */
 
+import { randomUUID } from 'node:crypto';
 import { STATIONS } from '../shared/telemetry.mjs';
+
+const TICK_MS = 50;
 
 export class TelemetrySimulator {
   constructor(store, { targetRate = 288 } = {}) {
@@ -12,6 +15,12 @@ export class TelemetrySimulator {
     this.targetRate = targetRate; // Default: 288 events/sec network-wide (48 Hz per station)
     this.isRunning = false;
     this.timer = null;
+    this.runId = randomUUID();
+    this.sequence = 0;
+    this.stationIndex = 0;
+    this.sampleCredit = 0;
+    this.droppedEvents = 0;
+    this.generatedEvents = 0;
 
     // Station dynamic simulation state
     this.stationStates = new Map();
@@ -39,13 +48,10 @@ export class TelemetrySimulator {
     if (this.isRunning) return;
     this.isRunning = true;
 
-    // Interval calculation:
-    // With 6 stations, if targetRate is 288 rps, each cycle emits 6 events.
-    // Interval = 6 / 288 * 1000 = ~20.83 ms
-    const intervalMs = Math.max(10, Math.floor((STATIONS.length / this.targetRate) * 1000));
-
-    this.timer = setInterval(() => this._tick(), intervalMs);
-    console.log(`[Simulator] Started telemetry simulation at ~${this.targetRate} readings/sec (interval ${intervalMs}ms)`);
+    this.lastTick = performance.now();
+    this.sampleCredit = 0;
+    this.timer = setInterval(() => this._tick(), TICK_MS);
+    console.log(`[Simulator] Started telemetry simulation at ${this.targetRate} readings/sec target`);
   }
 
   stop() {
@@ -106,7 +112,14 @@ export class TelemetrySimulator {
 
   _tick() {
     const now = Date.now();
-    const events = [];
+    const tick = performance.now();
+    const elapsed = Math.min(100, tick - this.lastTick);
+    this.lastTick = tick;
+    this.sampleCredit += elapsed * this.targetRate / 1000;
+    const count = Math.floor(this.sampleCredit);
+    this.sampleCredit -= count;
+    if (!count) return;
+    const readings = new Map();
 
     // Clean expired faults
     for (const [stId, fault] of this.activeFaults.entries()) {
@@ -161,25 +174,27 @@ export class TelemetrySimulator {
       state.vibration += (targetVib - state.vibration) * 0.2;
       state.current += (targetCur - state.current) * 0.2;
 
-      events.push({
-        stationId: st.id,
-        eventId: `sim_${st.id}_${now}_${Math.floor(Math.random() * 10000)}`,
-        timestamp: now,
-        metrics: {
+      readings.set(st.id, {
           waterLevel: Number(state.waterLevel.toFixed(3)),
           outflow: Number(state.outflow.toFixed(1)),
           vibration: Number(state.vibration.toFixed(2)),
           current: Number(state.current.toFixed(1))
-        }
       });
     }
 
-    // Submit generated events into the store write queue
-    this.store.enqueueBatch(events).catch(err => {
-      // Simulator backpressure handling
-      if (err.code === 'QUEUE_OVERLOAD') {
-        // Dropping frame to allow queue drain
-      }
+    const events = Array.from({ length: count }, (_, index) => {
+      const stationId = STATIONS[this.stationIndex].id;
+      this.stationIndex = (this.stationIndex + 1) % STATIONS.length;
+      return {
+        stationId,
+        eventId: `sim_${this.runId}_${++this.sequence}`,
+        timestamp: now - Math.floor((count - index - 1) * elapsed / count),
+        metrics: readings.get(stationId)
+      };
+    });
+    this.generatedEvents += events.length;
+    this.store.enqueueBatch(events).catch(() => {
+      this.droppedEvents += events.length;
     });
   }
 }

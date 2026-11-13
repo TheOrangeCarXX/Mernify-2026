@@ -40,6 +40,13 @@ import {
 import { STATIONS, STATION_MAP } from '../shared/telemetry.mjs';
 import { useTelemetryStream } from './live.jsx';
 import { TelemetryPlot } from './plot.jsx';
+import './styles.css';
+
+const faultLabels = {
+  'storm-surge': 'Storm surge',
+  'intake-blockage': 'Intake blockage',
+  'motor-overload': 'Motor overload'
+};
 
 // Web Audio API Synthesizer for SCADA Control Room Alarms
 function playScadaAlertChime(isCritical = false) {
@@ -64,19 +71,25 @@ function playScadaAlertChime(isCritical = false) {
 
     osc.start();
     osc.stop(ctx.currentTime + 0.2);
+    osc.onended = () => { void ctx.close().catch(() => {}); };
   } catch (e) {
     // Audio context may be blocked before first user gesture
   }
 }
 
 export function FloodlineApp() {
+  const stationParam = new URLSearchParams(window.location.search).get('station');
   const {
     selectedStationId,
     selectStation,
     connectionStatus,
     socketId,
     currentUser,
+    sessionChecked,
+    signIn,
+    signOut,
     seriesState,
+    historyError,
     fleetSummary,
     incidents,
     metricsSummary,
@@ -87,25 +100,45 @@ export function FloodlineApp() {
     triggerFault,
     clearFault,
     changeSimulatorRate,
-    exportIncidentCsv,
+    getLatestIncidents,
     testReconnect
-  } = useTelemetryStream({ defaultStationId: 'canal-junction' });
+  } = useTelemetryStream({ defaultStationId: STATION_MAP.has(stationParam) ? stationParam : 'canal-junction' });
 
   const [activeMetricTab, setActiveMetricTab] = useState('all');
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [faultActionNotice, setFaultActionNotice] = useState(null);
+  const noticeTimer = useRef(null);
   const [audioEnabled, setAudioEnabled] = useState(false);
   const [autoDemoStep, setAutoDemoStep] = useState(null); // null = inactive, { step, label }
-  const [selectedSimRate, setSelectedSimRate] = useState(288);
+  const [demoComplete, setDemoComplete] = useState(false);
+  const [incidentFilter, setIncidentFilter] = useState('all');
+  const [stationFilter, setStationFilter] = useState('all');
+  const selectedSimRate = fleetSummary.metrics?.simulatorRate ?? 288;
 
   const currentStation = STATION_MAP.get(selectedStationId) || STATIONS[0];
   const stationSummary = fleetSummary.stations.find(s => s.id === selectedStationId);
-  const currentSeverity = stationSummary?.severity || 'normal';
+  const currentSeverity = connectionStatus === 'disconnected' ? 'offline' : stationSummary?.severity || 'offline';
+  const selectedFault = fleetSummary.activeFaults.find(fault => fault.stationId === selectedStationId);
+  const canOperate = currentUser?.role === 'operator';
 
   // Severity Counts
   const normalCount = fleetSummary.stations.filter(s => s.severity === 'normal').length;
   const warningCount = fleetSummary.stations.filter(s => s.severity === 'warning').length;
   const criticalCount = fleetSummary.stations.filter(s => s.severity === 'critical').length;
+  const offlineCount = fleetSummary.stations.filter(s => s.severity === 'offline').length;
+  const visibleStations = STATIONS.filter(station => stationFilter === 'all' ||
+    fleetSummary.stations.find(summary => summary.id === station.id)?.severity !== 'normal');
+  const visibleIncidents = (incidentFilter === 'station'
+    ? incidents.filter(incident => incident.stationId === selectedStationId)
+    : incidents).slice(0, 5);
+
+  function showNotice(message, duration = 4000) {
+    clearTimeout(noticeTimer.current);
+    setFaultActionNotice(message);
+    if (duration) noticeTimer.current = setTimeout(() => setFaultActionNotice(null), duration);
+  }
+
+  useEffect(() => () => clearTimeout(noticeTimer.current), []);
 
   // Sound Audio Alarm on Critical State transition
   const prevSeverityRef = useRef(currentSeverity);
@@ -117,32 +150,41 @@ export function FloodlineApp() {
   }, [currentSeverity, audioEnabled]);
 
   // Handle Fault Trigger
-  const handleTriggerFault = async (type) => {
-    setFaultActionNotice(`Triggering ${type}...`);
-    const res = await triggerFault(selectedStationId, type, 60);
+  const handleTriggerFault = async (type, stationId = selectedStationId) => {
+    showNotice(`Triggering ${faultLabels[type]}…`, 0);
+    const res = await triggerFault(stationId, type, 60);
     if (res?.success) {
-      setFaultActionNotice(`Active: ${type} (60s duration)`);
+      showNotice(`${faultLabels[type]} simulation started.`);
       if (audioEnabled) playScadaAlertChime(true);
-      setTimeout(() => setFaultActionNotice(null), 4000);
-    }
+    } else showNotice(res?.error || 'Could not trigger the fault.');
+    return Boolean(res?.success);
   };
 
-  const handleClearFault = async () => {
-    setFaultActionNotice('Clearing faults...');
-    await clearFault(selectedStationId);
-    setFaultActionNotice('Fault cleared. Returning to nominal state.');
-    setTimeout(() => setFaultActionNotice(null), 3000);
+  const handleClearFault = async (stationId = selectedStationId) => {
+    showNotice('Clearing the fault…', 0);
+    const result = await clearFault(stationId);
+    showNotice(result?.success
+      ? 'Fault cleared. Returning to nominal state.'
+      : result?.error || 'Could not clear the fault.');
   };
 
   const handleSimRateChange = async (rate) => {
-    setSelectedSimRate(rate);
-    await changeSimulatorRate(rate);
-    setFaultActionNotice(`Throughput updated: ${rate} readings/s across 6 stations`);
-    setTimeout(() => setFaultActionNotice(null), 3000);
+    const result = await changeSimulatorRate(rate);
+    showNotice(result?.success
+      ? `Simulator target updated to ${result.rate.toLocaleString()} readings/s`
+      : result?.error || 'Could not update the simulator target.');
   };
 
-  // Autonomous Guided Demo Tour
+  // Guided demo
   const autoDemoTimerRef = useRef(null);
+  const autoDemoRunRef = useRef(0);
+  const autoDemoFaultRef = useRef(false);
+  const demoStation = 'canal-junction';
+
+  useEffect(() => () => {
+    autoDemoRunRef.current++;
+    clearTimeout(autoDemoTimerRef.current);
+  }, []);
 
   const startAutoDemo = () => {
     if (autoDemoStep) {
@@ -151,17 +193,28 @@ export function FloodlineApp() {
     }
 
     setAudioEnabled(true);
+    setDemoComplete(false);
+    const runId = ++autoDemoRunRef.current;
     let stepIndex = 1;
 
-    const runStep = () => {
+    const runStep = async () => {
+      if (runId !== autoDemoRunRef.current) return;
       if (stepIndex === 1) {
         setAutoDemoStep({ step: 1, total: 5, label: '1/5: Monitoring Canal Junction nominal telemetry (288 rps)' });
-        selectStation('canal-junction');
-        returnToLive();
+        returnToLive(demoStation);
         autoDemoTimerRef.current = setTimeout(() => { stepIndex = 2; runStep(); }, 3500);
       } else if (stepIndex === 2) {
         setAutoDemoStep({ step: 2, total: 5, label: '2/5: Inundation event! Injecting Storm Surge (+1.8m surge)' });
-        handleTriggerFault('storm-surge');
+        const started = await handleTriggerFault('storm-surge', demoStation);
+        if (runId !== autoDemoRunRef.current) {
+          if (started) void clearFault(demoStation);
+          return;
+        }
+        if (!started) {
+          setAutoDemoStep(null);
+          return;
+        }
+        autoDemoFaultRef.current = true;
         autoDemoTimerRef.current = setTimeout(() => { stepIndex = 3; runStep(); }, 4000);
       } else if (stepIndex === 3) {
         setAutoDemoStep({ step: 3, total: 5, label: '3/5: Station room isolation: East Sluice remains healthy while fleet alerts' });
@@ -169,16 +222,21 @@ export function FloodlineApp() {
         autoDemoTimerRef.current = setTimeout(() => { stepIndex = 4; runStep(); }, 4000);
       } else if (stepIndex === 4) {
         setAutoDemoStep({ step: 4, total: 5, label: '4/5: Forensic Replay: Opening MongoDB archived storm incident' });
-        selectStation('canal-junction');
-        if (incidents.length > 0) openIncidentReplay(incidents[0]);
+        const archive = await getLatestIncidents().catch(() => incidents);
+        if (runId !== autoDemoRunRef.current) return;
+        const incident = archive.find(item => item.stationId === demoStation && !item.resolved) ??
+          archive.find(item => item.stationId === demoStation);
+        if (incident) openIncidentReplay(incident);
+        else returnToLive(demoStation);
         autoDemoTimerRef.current = setTimeout(() => { stepIndex = 5; runStep(); }, 4500);
       } else if (stepIndex === 5) {
         setAutoDemoStep({ step: 5, total: 5, label: '5/5: Resuming rolling live stream and clearing injected fault' });
-        returnToLive();
-        handleClearFault();
+        returnToLive(demoStation);
+        if (autoDemoFaultRef.current) void handleClearFault(demoStation);
+        autoDemoFaultRef.current = false;
         autoDemoTimerRef.current = setTimeout(() => {
-          setAutoDemoStep({ step: 5, total: 5, label: '✓ Demo Walkthrough Complete! All 6 criteria demonstrated.' });
-          setTimeout(() => setAutoDemoStep(null), 3000);
+          setDemoComplete(true);
+          setAutoDemoStep(null);
         }, 3000);
       }
     };
@@ -187,14 +245,19 @@ export function FloodlineApp() {
   };
 
   const stopAutoDemo = () => {
+    autoDemoRunRef.current++;
     if (autoDemoTimerRef.current) {
       clearTimeout(autoDemoTimerRef.current);
       autoDemoTimerRef.current = null;
     }
     setAutoDemoStep(null);
-    returnToLive();
-    handleClearFault();
+    setDemoComplete(false);
+    returnToLive(demoStation);
+    if (autoDemoFaultRef.current) void handleClearFault(demoStation);
+    autoDemoFaultRef.current = false;
   };
+
+  if (sessionChecked && !currentUser) return <SignIn onSignIn={signIn} />;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-slate-950">
@@ -233,18 +296,19 @@ export function FloodlineApp() {
             <span className="hidden md:inline">{audioEnabled ? 'Alarm ON' : 'Muted'}</span>
           </button>
 
-          {/* Autonomous Demo Tour Button */}
+          {/* Guided demo control */}
           <button
             onClick={startAutoDemo}
+            disabled={!canOperate}
             className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-semibold border transition ${
               autoDemoStep
                 ? 'bg-rose-600 text-white border-rose-500 animate-pulse'
                 : 'bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white border-cyan-500/50 shadow'
             }`}
-            title="Run 2-Minute Autonomous Demo Walkthrough"
+            title="Run guided demo"
           >
             {autoDemoStep ? <Square className="w-3 h-3 fill-current" /> : <Play className="w-3 h-3 fill-current" />}
-            <span>{autoDemoStep ? 'Stop Tour' : '▶ Run Auto-Demo'}</span>
+            <span>{autoDemoStep ? 'Stop Tour' : 'Run Demo'}</span>
           </button>
 
           {/* Connection Status Pill */}
@@ -265,10 +329,14 @@ export function FloodlineApp() {
           {/* User Session / Role */}
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-800/80 border border-slate-700 text-xs">
             <User className="w-3.5 h-3.5 text-cyan-400" />
-            <span className="font-medium text-slate-200 hidden sm:inline">{currentUser?.displayName || 'Chief Operator'}</span>
+            <span className="font-medium text-slate-200 hidden sm:inline">{currentUser?.displayName || 'Guest'}</span>
             <span className="text-[10px] uppercase px-1 py-0.2 bg-cyan-900/60 text-cyan-300 rounded font-mono">
-              {currentUser?.role || 'operator'}
+              {currentUser?.role || 'signed out'}
             </span>
+            {currentUser && currentUser.username !== 'demo-operator' &&
+              <button className="text-cyan-300 hover:underline" onClick={() => {
+                void signOut().catch(error => showNotice(error.message));
+              }}>Sign out</button>}
           </div>
 
           {/* Diagnostics Button */}
@@ -284,6 +352,10 @@ export function FloodlineApp() {
       </header>
 
       {/* Auto-Demo Active Banner */}
+      {demoComplete && <div role="status" className="flex items-center justify-between gap-2 border-b border-emerald-800 bg-emerald-950 px-4 py-2 text-sm text-emerald-200">
+        <span>Demo walkthrough complete</span>
+        <button onClick={() => setDemoComplete(false)} className="underline">Dismiss</button>
+      </div>}
       {autoDemoStep && (
         <div className="bg-gradient-to-r from-cyan-950 via-blue-900 to-indigo-950 border-b border-cyan-500/50 px-4 py-2 text-xs font-mono flex items-center justify-between text-cyan-200 shadow-inner">
           <div className="flex items-center gap-2">
@@ -313,16 +385,16 @@ export function FloodlineApp() {
           </div>
           <div className="flex items-center gap-1.5">
             <Database className="w-3.5 h-3.5 text-emerald-400" />
-            <span>DB Writes:</span>
+            <span>Stored:</span>
             <span className="font-bold text-white">
-              {fleetSummary.metrics?.persistedSec ?? selectedSimRate} <span className="text-slate-500">ops/s</span>
+              {fleetSummary.metrics?.persistedSec ?? 0} <span className="text-slate-500">readings/s</span>
             </span>
           </div>
           <div className="flex items-center gap-1.5">
             <Radio className="w-3.5 h-3.5 text-purple-400" />
-            <span>Broadcasts:</span>
+            <span>Published:</span>
             <span className="font-bold text-white">
-              {fleetSummary.metrics?.broadcastSec ?? selectedSimRate} <span className="text-slate-500">pkts/s</span>
+              {fleetSummary.metrics?.broadcastSec ?? 0} <span className="text-slate-500">readings/s</span>
             </span>
           </div>
           <div className="flex items-center gap-1.5 hidden md:flex">
@@ -332,6 +404,12 @@ export function FloodlineApp() {
               {fleetSummary.metrics?.queueLength ?? 0} <span className="text-slate-500">/ 16k</span>
             </span>
           </div>
+          {!!fleetSummary.metrics?.simulatorDroppedEvents && <span className="text-amber-300">
+            Simulator drops: {fleetSummary.metrics.simulatorDroppedEvents.toLocaleString()}
+          </span>}
+          {fleetSummary.metrics?.storageReady === false && <span role="status" className="text-amber-300">
+            MongoDB writes interrupted
+          </span>}
         </div>
 
         {/* Live Simulator Rate Selector */}
@@ -346,6 +424,7 @@ export function FloodlineApp() {
             ].map(r => (
               <button
                 key={r.val}
+                disabled={!canOperate}
                 onClick={() => handleSimRateChange(r.val)}
                 className={`px-2 py-0.5 rounded transition ${
                   selectedSimRate === r.val
@@ -373,13 +452,14 @@ export function FloodlineApp() {
             <span className="w-2 h-2 rounded-full bg-rose-400"></span>
             Crit: {criticalCount}
           </span>
+          {offlineCount > 0 && <span className="text-slate-300">No signal: {offlineCount}</span>}
         </div>
       </section>
 
       {/* Main Content Layout */}
       <main className="flex-1 p-3 sm:p-5 max-w-[1600px] w-full mx-auto grid grid-cols-1 lg:grid-cols-12 gap-5">
         {/* Left Column: Basin Schematic & Station Roster (4 cols) */}
-        <div className="lg:col-span-4 flex flex-col gap-4">
+        <div className="min-w-0 lg:col-span-4 flex flex-col gap-4">
           {/* Basin Schematic SVG Map */}
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-3 shadow-lg">
             <div className="flex items-center justify-between mb-2">
@@ -418,19 +498,29 @@ export function FloodlineApp() {
                 {STATIONS.map((st) => {
                   const state = fleetSummary.stations.find(s => s.id === st.id);
                   const isSelected = selectedStationId === st.id;
-                  const sev = state?.severity || 'normal';
+                  const sev = state?.severity || 'offline';
 
-                  const nodeColor = sev === 'critical' ? '#ef4444' : sev === 'warning' ? '#f59e0b' : '#10b981';
+                  const nodeColor = sev === 'critical' ? '#ef4444' : sev === 'warning' ? '#f59e0b' : sev === 'offline' ? '#64748b' : '#10b981';
                   const glowColor = sev === 'critical' ? 'rgba(239, 68, 68, 0.5)' : sev === 'warning' ? 'rgba(245, 158, 11, 0.4)' : 'rgba(16, 185, 129, 0.3)';
 
                   return (
                     <g
                       key={st.id}
-                      className="cursor-pointer transition transform hover:scale-110"
+                      role="button"
+                      tabIndex={0}
+                      aria-label={st.name + ', ' + (sev === 'offline' ? 'no signal' : sev)}
+                      aria-pressed={isSelected}
+                      className="cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400"
                       onClick={() => selectStation(st.id)}
+                      onKeyDown={event => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          selectStation(st.id);
+                        }
+                      }}
                     >
                       {(sev === 'critical' || sev === 'warning') && (
-                        <circle cx={st.coordinates.x} cy={st.coordinates.y} r={isSelected ? 32 : 26} fill={glowColor} className="animate-ping" />
+                        <circle cx={st.coordinates.x} cy={st.coordinates.y} r={isSelected ? 32 : 26} fill={glowColor} className="pointer-events-none animate-ping" />
                       )}
                       <circle cx={st.coordinates.x} cy={st.coordinates.y} r={isSelected ? 22 : 18} fill="#0f172a" stroke={isSelected ? '#38bdf8' : nodeColor} strokeWidth={isSelected ? 3.5 : 2} />
                       <circle cx={st.coordinates.x} cy={st.coordinates.y} r={6} fill={nodeColor} />
@@ -438,7 +528,7 @@ export function FloodlineApp() {
                         {st.code}
                       </text>
                       <text x={st.coordinates.x} y={st.coordinates.y + 36} textAnchor="middle" fill="#94a3b8" fontSize="11" fontFamily="monospace">
-                        {state?.waterLevel ? `${state.waterLevel.toFixed(1)}m` : '--'}
+                        {sev === 'offline' ? '--' : `${state.waterLevel.toFixed(1)}m`}
                       </text>
                     </g>
                   );
@@ -449,16 +539,21 @@ export function FloodlineApp() {
 
           {/* Station Roster (List of all 6 stations) */}
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-3 shadow-lg flex-1">
-            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-300 mb-2 flex items-center justify-between">
-              <span>Basin Pump Stations ({STATIONS.length})</span>
-              <span className="text-[10px] text-slate-500 font-mono">Live Roster</span>
-            </h2>
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-xs font-bold uppercase tracking-wider text-slate-300">Basin Pump Stations</h2>
+              <select aria-label="Filter stations" className="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs"
+                value={stationFilter} onChange={event => setStationFilter(event.target.value)}>
+                <option value="all">All stations</option>
+                <option value="attention">Needs attention</option>
+              </select>
+            </div>
 
             <div className="space-y-1.5">
-              {STATIONS.map((st) => {
+              {!visibleStations.length && <p className="p-2 text-xs text-slate-400">No stations need attention.</p>}
+              {visibleStations.map((st) => {
                 const state = fleetSummary.stations.find(s => s.id === st.id);
                 const isSelected = selectedStationId === st.id;
-                const sev = state?.severity || 'normal';
+                const sev = state?.severity || 'offline';
 
                 return (
                   <div
@@ -477,7 +572,7 @@ export function FloodlineApp() {
                             ? 'bg-rose-500 shadow-[0_0_8px_#f43f5e]'
                             : sev === 'warning'
                             ? 'bg-amber-400 shadow-[0_0_8px_#fbbf24]'
-                            : 'bg-emerald-400'
+                            : sev === 'offline' ? 'bg-slate-500' : 'bg-emerald-400'
                         }`}
                       />
                       <div>
@@ -486,8 +581,8 @@ export function FloodlineApp() {
                           <span className="text-[10px] text-slate-500 font-mono">[{st.code}]</span>
                         </div>
                         <div className="text-[11px] text-slate-400 flex items-center gap-3 font-mono mt-0.5">
-                          <span>WL: <strong className="text-cyan-400">{state?.waterLevel ? `${state.waterLevel.toFixed(2)}m` : '--'}</strong></span>
-                          <span>Flow: <strong className="text-emerald-400">{state?.outflow ? `${state.outflow.toFixed(0)}L/s` : '--'}</strong></span>
+                          <span>WL: <strong className="text-cyan-400">{sev === 'offline' ? '--' : `${state.waterLevel.toFixed(2)}m`}</strong></span>
+                          <span>Flow: <strong className="text-emerald-400">{sev === 'offline' ? '--' : `${state.outflow.toFixed(0)}L/s`}</strong></span>
                         </div>
                       </div>
                     </div>
@@ -499,10 +594,10 @@ export function FloodlineApp() {
                             ? 'bg-rose-950/80 text-rose-300 border-rose-800'
                             : sev === 'warning'
                             ? 'bg-amber-950/80 text-amber-300 border-amber-800'
-                            : 'bg-emerald-950/80 text-emerald-300 border-emerald-800'
+                            : sev === 'offline' ? 'bg-slate-800 text-slate-300 border-slate-600' : 'bg-emerald-950/80 text-emerald-300 border-emerald-800'
                         }`}
                       >
-                        {sev}
+                        {sev === 'offline' ? 'No signal' : sev}
                       </span>
                     </div>
                   </div>
@@ -513,11 +608,11 @@ export function FloodlineApp() {
         </div>
 
         {/* Right Column: Selected Station Header, Metric Cards, Canvas Plot, Incident Timeline (8 cols) */}
-        <div className="lg:col-span-8 flex flex-col gap-4">
+        <div className="min-w-0 lg:col-span-8 flex flex-col gap-4">
           {/* Selected Station Control & Fault Injection Bar */}
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-3.5 shadow-lg flex flex-col md:flex-row md:items-center justify-between gap-3">
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <h1 className="text-base sm:text-lg font-extrabold text-white">{currentStation.name}</h1>
                 <span className="font-mono text-xs px-2 py-0.5 rounded bg-slate-800 text-cyan-400 border border-slate-700">
                   {currentStation.code}
@@ -528,15 +623,20 @@ export function FloodlineApp() {
                       ? 'bg-rose-950 text-rose-300 border-rose-700 animate-pulse'
                       : currentSeverity === 'warning'
                       ? 'bg-amber-950 text-amber-300 border-amber-700'
+                      : currentSeverity === 'offline'
+                      ? 'bg-slate-800 text-slate-300 border-slate-600'
                       : 'bg-emerald-950 text-emerald-300 border-emerald-800'
                   }`}
                 >
-                  {currentSeverity}
+                  {currentSeverity === 'offline' ? 'No signal' : currentSeverity}
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
                 {currentStation.description} • {currentStation.pumpCount} Pumps • Capacity: {currentStation.ratedCapacity} L/s
               </p>
+              {selectedFault && <p className="mt-2 text-xs text-amber-300">
+                {faultLabels[selectedFault.type]} simulation · {selectedFault.remainingSec}s remaining
+              </p>}
             </div>
 
             {/* Operator Fault Injection Actions */}
@@ -544,6 +644,7 @@ export function FloodlineApp() {
               <span className="text-[11px] text-slate-400 font-medium mr-1 hidden sm:inline">Fault Sim:</span>
               <button
                 onClick={() => handleTriggerFault('storm-surge')}
+                disabled={!canOperate}
                 className="px-2.5 py-1 text-xs font-semibold rounded bg-rose-950/80 hover:bg-rose-900 text-rose-200 border border-rose-800/80 transition flex items-center gap-1"
                 title="Inject Storm Surge: High water level, peak outflow"
               >
@@ -552,6 +653,7 @@ export function FloodlineApp() {
               </button>
               <button
                 onClick={() => handleTriggerFault('intake-blockage')}
+                disabled={!canOperate}
                 className="px-2.5 py-1 text-xs font-semibold rounded bg-amber-950/80 hover:bg-amber-900 text-amber-200 border border-amber-800/80 transition flex items-center gap-1"
                 title="Inject Intake Blockage: High water level, collapsed outflow, cavitation"
               >
@@ -560,6 +662,7 @@ export function FloodlineApp() {
               </button>
               <button
                 onClick={() => handleTriggerFault('motor-overload')}
+                disabled={!canOperate}
                 className="px-2.5 py-1 text-xs font-semibold rounded bg-purple-950/80 hover:bg-purple-900 text-purple-200 border border-purple-800/80 transition flex items-center gap-1"
                 title="Inject Motor Overload: Severe vibration, electrical overcurrent"
               >
@@ -567,7 +670,8 @@ export function FloodlineApp() {
                 Overload
               </button>
               <button
-                onClick={handleClearFault}
+                onClick={() => handleClearFault()}
+                disabled={!canOperate}
                 className="px-2.5 py-1 text-xs font-semibold rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition"
                 title="Clear all active faults on this station"
               >
@@ -577,8 +681,14 @@ export function FloodlineApp() {
           </div>
 
           {/* Fault Notice Notification */}
+          {historyError && (
+            <div role="alert" className="flex items-center justify-between gap-2 rounded border border-amber-800 bg-amber-950 p-2 text-xs text-amber-200">
+              <span>{historyError}</span>
+              <button className="underline" onClick={() => seriesState.isHistoricalLocked ? shiftHistoricalWindow(0) : returnToLive()}>Retry</button>
+            </div>
+          )}
           {faultActionNotice && (
-            <div className="bg-cyan-950/80 border border-cyan-800 text-cyan-200 px-3 py-1.5 rounded-md text-xs font-mono flex items-center gap-2">
+            <div role="status" className="bg-cyan-950/80 border border-cyan-800 text-cyan-200 px-3 py-1.5 rounded-md text-xs font-mono flex items-center gap-2">
               <RefreshCw className="w-3.5 h-3.5 animate-spin text-cyan-400" />
               <span>{faultActionNotice}</span>
             </div>
@@ -711,29 +821,32 @@ export function FloodlineApp() {
             windowPreset={seriesState.windowPreset}
             onWindowPresetChange={setWindowPreset}
             isHistoricalLocked={seriesState.isHistoricalLocked}
+            historicalRange={seriesState.historicalRange}
             onReturnToLive={returnToLive}
             onShiftWindow={shiftHistoricalWindow}
           />
 
           {/* Incident Timeline & Historical Replay Selector with CSV Export */}
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-3.5 shadow-lg">
-            <div className="flex items-center justify-between mb-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5">
               <h2 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
                 <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
-                Incident Timeline & Forensic Data Export
+                Incident Timeline
               </h2>
-              <span className="text-[10px] text-slate-500 font-mono">
-                Click to inspect replay window or download incident telemetry
-              </span>
+              <select aria-label="Filter incidents by station" className="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs"
+                value={incidentFilter} onChange={event => setIncidentFilter(event.target.value)}>
+                <option value="all">All stations</option>
+                <option value="station">Selected station</option>
+              </select>
             </div>
 
-            {incidents.length === 0 ? (
+            {visibleIncidents.length === 0 ? (
               <div className="text-xs text-slate-500 font-mono py-3 text-center">
-                No active or historical incidents recorded.
+                No incidents in this view.
               </div>
             ) : (
               <div className="space-y-2">
-                {incidents.slice(0, 5).map((inc) => {
+                {visibleIncidents.map((inc) => {
                   const durationSec = Math.round(((inc.endTime || Date.now()) - inc.startTime) / 1000);
                   const isCrit = inc.severity === 'critical';
 
@@ -747,7 +860,7 @@ export function FloodlineApp() {
                       }`}
                     >
                       <div className="cursor-pointer" onClick={() => openIncidentReplay(inc)}>
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <span
                             className={`text-[10px] font-mono font-bold uppercase px-1.5 py-0.2 rounded border ${
                               isCrit ? 'bg-rose-900 text-rose-200 border-rose-700' : 'bg-amber-900 text-amber-200 border-amber-700'
@@ -764,11 +877,11 @@ export function FloodlineApp() {
                           <span className="text-[11px] text-slate-500 font-mono">
                             ({durationSec}s duration)
                           </span>
-                          {inc.resolved && (
-                            <span className="text-[10px] text-emerald-400 bg-emerald-950/60 px-1.5 py-0.2 rounded border border-emerald-800 font-mono">
-                              Resolved
-                            </span>
-                          )}
+                          <span className={`text-[10px] px-1.5 rounded border font-mono ${inc.resolved
+                            ? 'text-emerald-400 bg-emerald-950/60 border-emerald-800'
+                            : 'text-amber-300 bg-amber-950/60 border-amber-800'}`}>
+                            {inc.resolved ? 'Resolved' : 'Active'}
+                          </span>
                         </div>
                         <p className="text-xs text-slate-300 mt-1">
                           {inc.reasons?.[0] || 'Anomalous telemetry conditions detected'}
@@ -776,14 +889,15 @@ export function FloodlineApp() {
                       </div>
 
                       <div className="flex items-center gap-2 self-end sm:self-center">
-                        <button
-                          onClick={() => exportIncidentCsv(inc.incidentId)}
+                        <a
+                          href={`/api/incidents/${encodeURIComponent(inc.incidentId)}/export`}
+                          download
                           className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] font-mono border border-slate-700 transition flex items-center gap-1"
                           title="Export incident telemetry as CSV"
                         >
                           <Download className="w-3 h-3 text-cyan-400" />
                           <span>CSV</span>
-                        </button>
+                        </a>
                         <button
                           onClick={() => openIncidentReplay(inc)}
                           className="px-2.5 py-1 bg-cyan-700 hover:bg-cyan-600 text-white rounded text-xs font-medium transition flex items-center gap-1"
@@ -807,6 +921,7 @@ export function FloodlineApp() {
           <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-lg w-full p-5 shadow-2xl relative">
             <button
               onClick={() => setShowDiagnostics(false)}
+              aria-label="Close diagnostics"
               className="absolute top-4 right-4 text-slate-400 hover:text-white"
             >
               <X className="w-5 h-5" />
@@ -880,6 +995,39 @@ export function FloodlineApp() {
       </footer>
     </div>
   );
+}
+
+function SignIn({ onSignIn }) {
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  async function submit(event) {
+    event.preventDefault();
+    const fields = new FormData(event.currentTarget);
+    setBusy(true);
+    setError('');
+    try {
+      await onSignIn(fields.get('username'), fields.get('password'));
+    } catch (failure) {
+      setError(failure.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return <main className="min-h-screen grid place-items-center px-4">
+    <form className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-6 space-y-4" onSubmit={submit}>
+      <h1 className="text-xl font-bold">Sign in to Floodline</h1>
+      <label className="block text-sm">Username
+        <input className="block w-full mt-1 rounded bg-slate-950 border border-slate-700 p-2" name="username" autoComplete="username" required />
+      </label>
+      <label className="block text-sm">Password
+        <input className="block w-full mt-1 rounded bg-slate-950 border border-slate-700 p-2" name="password" type="password" autoComplete="current-password" required />
+      </label>
+      {error && <p role="alert" className="text-rose-300 text-sm">{error}</p>}
+      <button type="submit" disabled={busy} className="rounded bg-cyan-700 px-4 py-2 text-sm font-semibold disabled:opacity-50">
+        {busy ? 'Signing in…' : 'Sign in'}
+      </button>
+    </form>
+  </main>;
 }
 
 const rootEl = document.getElementById('root');

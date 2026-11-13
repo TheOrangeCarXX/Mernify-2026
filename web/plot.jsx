@@ -58,28 +58,45 @@ export function TelemetryPlot({
   windowPreset = '5m',
   onWindowPresetChange = () => {},
   isHistoricalLocked = false,
+  historicalRange = null,
   onReturnToLive = () => {},
   onShiftWindow = () => {}
 }) {
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
   const [hoveredData, setHoveredData] = useState(null);
+  const [size, setSize] = useState(null);
+
+  useEffect(() => {
+    setHoveredData(null);
+  }, [station, historicalRange?.from, historicalRange?.to]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      setSize({ width, height });
+    });
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !size?.width || !size.height) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
     // Handle high DPI displays
-    const rect = canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    ctx.scale(dpr, dpr);
+    const width = Math.round(size.width * dpr);
+    const height = Math.round(size.height * dpr);
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    const w = rect.width;
-    const h = rect.height;
+    const w = size.width;
+    const h = size.height;
 
     // Background
     ctx.fillStyle = '#0a0f18';
@@ -89,7 +106,7 @@ export function TelemetryPlot({
       ctx.fillStyle = '#475569';
       ctx.font = '14px "JetBrains Mono", monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('WAITING FOR TELEMETRY STREAM OR HISTORICAL DATA...', w / 2, h / 2);
+      ctx.fillText('Waiting for telemetry…', w / 2, h / 2);
       return;
     }
 
@@ -97,8 +114,8 @@ export function TelemetryPlot({
     const plotW = w - padding.left - padding.right;
     const plotH = h - padding.top - padding.bottom;
 
-    const minTime = points[0].timestamp;
-    const maxTime = Math.max(points[points.length - 1].timestamp, minTime + 1000);
+    const minTime = historicalRange?.from ?? points[0].timestamp;
+    const maxTime = historicalRange?.to ?? Math.max(points[points.length - 1].timestamp, minTime + 1000);
 
     // Draw Grid Lines
     ctx.strokeStyle = '#1e293b';
@@ -114,7 +131,7 @@ export function TelemetryPlot({
       ctx.stroke();
     }
 
-    const numGridX = 6;
+    const numGridX = w < 520 ? 3 : 6;
     for (let i = 0; i <= numGridX; i++) {
       const x = padding.left + (plotW / numGridX) * i;
       ctx.beginPath();
@@ -132,11 +149,12 @@ export function TelemetryPlot({
     ctx.setLineDash([]);
 
     // Highlight Warning / Critical Anomaly Regions
-    for (let i = 0; i < points.length - 1; i++) {
+    for (let i = 0; i < points.length; i++) {
       const p = points[i];
       if (p.severity === 'warning' || p.severity === 'critical') {
         const x1 = padding.left + ((p.timestamp - minTime) / (maxTime - minTime)) * plotW;
-        const x2 = padding.left + ((points[i + 1].timestamp - minTime) / (maxTime - minTime)) * plotW;
+        const next = points[i + 1]?.timestamp ?? p.timestamp;
+        const x2 = padding.left + ((next - minTime) / (maxTime - minTime)) * plotW;
         ctx.fillStyle = p.severity === 'critical' ? 'rgba(239, 68, 68, 0.18)' : 'rgba(245, 158, 11, 0.12)';
         ctx.fillRect(x1, padding.top, Math.max(2, x2 - x1), plotH);
       }
@@ -149,6 +167,7 @@ export function TelemetryPlot({
     // Draw Metric Lines
     metricsToDraw.forEach(metricKey => {
       const cfg = METRIC_CONFIG[metricKey];
+      const toY = value => padding.top + plotH * (1 - Math.max(0, Math.min(1, (value - cfg.min) / (cfg.max - cfg.min))));
       const stationWarn = station ? (station[`nominal${metricKey.charAt(0).toUpperCase() + metricKey.slice(1)}`]?.warning || cfg.warning) : cfg.warning;
       const stationCrit = station ? (station[`nominal${metricKey.charAt(0).toUpperCase() + metricKey.slice(1)}`]?.critical || cfg.critical) : cfg.critical;
 
@@ -191,6 +210,20 @@ export function TelemetryPlot({
       }
 
       // Plot curve
+      if (activeMetric === metricKey) {
+        ctx.strokeStyle = cfg.color;
+        ctx.globalAlpha = 0.22;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (const point of points) {
+          if (!point.min || !point.max) continue;
+          const x = padding.left + ((point.timestamp - minTime) / (maxTime - minTime)) * plotW;
+          ctx.moveTo(x, toY(point.min[metricKey]));
+          ctx.lineTo(x, toY(point.max[metricKey]));
+        }
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
       ctx.strokeStyle = cfg.color;
       ctx.lineWidth = activeMetric === metricKey ? 2.5 : 1.5;
       ctx.beginPath();
@@ -198,12 +231,11 @@ export function TelemetryPlot({
       for (let i = 0; i < points.length; i++) {
         const p = points[i];
         const val = p.metrics ? p.metrics[metricKey] : 0;
-        const normVal = Math.max(0, Math.min(1, (val - cfg.min) / (cfg.max - cfg.min)));
-
         const x = padding.left + ((p.timestamp - minTime) / (maxTime - minTime)) * plotW;
-        const y = padding.top + plotH - normVal * plotH;
+        const y = toY(val);
 
         if (i === 0) ctx.moveTo(x, y);
+        else if (p.timestamp - points[i - 1].timestamp > (maxTime - minTime) / 15) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
       }
       ctx.stroke();
@@ -233,7 +265,7 @@ export function TelemetryPlot({
       ctx.stroke();
       ctx.setLineDash([]);
     }
-  }, [points, activeMetric, station, hoveredData]);
+  }, [points, activeMetric, station, hoveredData, size, historicalRange]);
 
   // Handle Mouse Hover Scrubbing
   const handleMouseMove = (e) => {
@@ -251,8 +283,8 @@ export function TelemetryPlot({
       return;
     }
 
-    const minTime = points[0].timestamp;
-    const maxTime = Math.max(points[points.length - 1].timestamp, minTime + 1000);
+    const minTime = historicalRange?.from ?? points[0].timestamp;
+    const maxTime = historicalRange?.to ?? Math.max(points[points.length - 1].timestamp, minTime + 1000);
     const timeRatio = (mouseX - paddingLeft) / plotW;
     const targetTime = minTime + timeRatio * (maxTime - minTime);
 
@@ -306,7 +338,7 @@ export function TelemetryPlot({
         </div>
 
         {/* Time Window & Historical Controls */}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {isHistoricalLocked && (
             <div className="flex items-center gap-1.5 bg-amber-500/20 text-amber-300 border border-amber-500/40 px-2 py-0.5 rounded text-xs">
               <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
@@ -326,7 +358,7 @@ export function TelemetryPlot({
                 <SkipForward className="w-3.5 h-3.5" />
               </button>
               <button
-                onClick={onReturnToLive}
+                onClick={() => onReturnToLive()}
                 className="ml-1 bg-amber-600 hover:bg-amber-500 text-white px-2 py-0.5 rounded text-xs font-semibold transition"
               >
                 Return to Live
@@ -399,7 +431,7 @@ export function TelemetryPlot({
 
       {/* Legend / Status Bar */}
       <div className="flex flex-wrap items-center justify-between px-4 py-2 bg-slate-950/90 border-t border-slate-800/80 text-xs text-slate-400 font-mono">
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
           <span className="flex items-center gap-1.5">
             <span className="w-2.5 h-2.5 rounded-full bg-cyan-400"></span>
             Water Level (m)
@@ -418,7 +450,7 @@ export function TelemetryPlot({
           </span>
         </div>
         <div className="text-slate-500">
-          {points.length} samples in active viewport
+          {points.reduce((count, point) => count + (point.count ?? 1), 0).toLocaleString()} readings · {points.length} plotted points
         </div>
       </div>
     </div>

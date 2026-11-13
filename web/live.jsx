@@ -6,6 +6,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
+import { MAX_FUTURE_SKEW_MS } from '../shared/telemetry.mjs';
 import { TelemetrySeriesManager, WINDOW_PRESETS } from './series.mjs';
 
 export function useTelemetryStream({ defaultStationId = 'canal-junction' } = {}) {
@@ -21,6 +22,7 @@ export function useTelemetryStream({ defaultStationId = 'canal-junction' } = {})
     bufferedCount: 0,
     isLoadingHistory: false
   });
+  const [historyError, setHistoryError] = useState(null);
 
   const [fleetSummary, setFleetSummary] = useState({
     stations: [],
@@ -36,8 +38,14 @@ export function useTelemetryStream({ defaultStationId = 'canal-junction' } = {})
 
   const [incidents, setIncidents] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
+  const [sessionChecked, setSessionChecked] = useState(false);
 
   const socketRef = useRef(null);
+  const selectedStationRef = useRef(defaultStationId);
+  const historyRequest = useRef(null);
+  const subscriptionVersion = useRef(0);
+  const historyRetry = useRef(null);
+  const reconnectTimer = useRef(null);
   const seriesManagerRef = useRef(null);
 
   // Initialize Series Manager
@@ -58,63 +66,109 @@ export function useTelemetryStream({ defaultStationId = 'canal-junction' } = {})
       if (res.ok) {
         const data = await res.json();
         setCurrentUser(data.user);
-      } else {
-        setCurrentUser({ username: 'guest-operator', role: 'operator', displayName: 'Operator (Demo)' });
-      }
+      } else setCurrentUser(null);
     } catch {
-      setCurrentUser({ username: 'local-operator', role: 'operator', displayName: 'Local Operator' });
+      setCurrentUser(null);
+    } finally {
+      setSessionChecked(true);
     }
   }, []);
+
+  const signIn = useCallback(async (username, password) => {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not sign in.');
+    setCurrentUser(data.user);
+  }, []);
+
+  const signOut = useCallback(async () => {
+    const res = await fetch('/api/auth/logout', { method: 'POST' });
+    if (!res.ok) throw new Error('Could not sign out.');
+    await refreshUser();
+  }, [refreshUser]);
 
   // Fetch incidents list
-  const refreshIncidents = useCallback(async () => {
-    try {
-      const res = await fetch('/api/incidents');
-      if (res.ok) {
-        const data = await res.json();
-        setIncidents(data.incidents || []);
-      }
-    } catch (e) {
-      console.warn('Failed to fetch incidents', e);
-    }
+  const getLatestIncidents = useCallback(async (signal) => {
+    const response = await fetch('/api/incidents', { signal });
+    if (!response.ok) throw new Error('Could not read the incident archive.');
+    return (await response.json()).incidents || [];
   }, []);
 
-  // Fetch Historical Telemetry and merge with live cursor
-  const fetchAndMergeHistory = useCallback(async (stationId, cursorSeq, preset = '5m') => {
-    const durationMs = WINDOW_PRESETS[preset] || (5 * 60 * 1000);
-    const to = Date.now();
-    const from = to - durationMs;
-
+  const refreshIncidents = useCallback(async (signal) => {
     try {
-      const url = `/api/stations/${stationId}/history?from=${from}&to=${to}&beforeSeq=${cursorSeq}&maxPoints=600`;
-      const res = await fetch(url);
+      const latest = await getLatestIncidents(signal);
+      if (!signal?.aborted) setIncidents(latest);
+    } catch (e) {
+      if (!signal?.aborted) console.warn('Failed to fetch incidents', e);
+    }
+  }, [getLatestIncidents]);
+
+  // Fetch Historical Telemetry and merge with live cursor
+  const fetchAndMergeHistory = useCallback(async (stationId, { from, to }, cursorSeq) => {
+    historyRequest.current?.abort();
+    const controller = new AbortController();
+    historyRequest.current = controller;
+    setHistoryError(null);
+    const maxPoints = 600;
+    const bucketMs = Math.max(1, Math.ceil((to - from) / (maxPoints - 1)));
+    if (cursorSeq !== undefined) seriesManager.setLiveResolution(bucketMs, from);
+    try {
+      const params = new URLSearchParams({ from, to, maxPoints, bucketMs });
+      if (cursorSeq !== undefined) params.set('beforeSeq', cursorSeq);
+      const res = await fetch(`/api/stations/${stationId}/history?${params}`, { signal: controller.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
 
-      seriesManager.applyHistory(data.readings || []);
+      if (!controller.signal.aborted) {
+        seriesManager.applyHistory(data.readings || []);
+        if (cursorSeq !== undefined) setConnectionStatus('connected');
+      }
     } catch (err) {
+      if (controller.signal.aborted) return;
       console.error('[Live Stream] Failed to load history:', err);
-      seriesManager.applyHistory([]); // Fallback to live stream only
+      seriesManager.applyHistory([]);
+      setHistoryError('Could not load the selected history window.');
+      if (cursorSeq !== undefined) setConnectionStatus('history unavailable');
     }
   }, [seriesManager]);
 
   // Subscribe to station room
   const subscribeToStation = useCallback((stationId) => {
+    historyRequest.current?.abort();
+    clearTimeout(historyRetry.current);
+    historyRetry.current = null;
+    const version = ++subscriptionVersion.current;
     const socket = socketRef.current;
     if (!socket || !socket.connected) return;
 
-    socket.emit('subscribe:station', { stationId }, (ack) => {
-      if (ack && !ack.error) {
+    setConnectionStatus('syncing');
+    socket.timeout(5000).emit('subscribe:station', { stationId }, (error, ack) => {
+      if (version !== subscriptionVersion.current || !socket.connected) return;
+      if (error || ack?.error) {
+        setConnectionStatus('history unavailable');
+        setHistoryError(ack?.error || 'Station subscription timed out.');
+      } else if (ack) {
         seriesManager.startStationSubscription(stationId, ack.latestSeq);
-        fetchAndMergeHistory(stationId, ack.latestSeq, seriesManager.windowPreset);
+        const from = ack.serverTime - WINDOW_PRESETS[seriesManager.windowPreset];
+        const to = ack.serverTime + MAX_FUTURE_SKEW_MS;
+        fetchAndMergeHistory(stationId, { from, to }, ack.latestSeq);
       }
     });
   }, [seriesManager, fetchAndMergeHistory]);
 
   // Setup Socket.IO connection
   useEffect(() => {
-    refreshUser();
-    refreshIncidents();
+    void refreshUser();
+  }, [refreshUser]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    const dashboardRequests = new AbortController();
+    void refreshIncidents(dashboardRequests.signal);
 
     const socket = io({
       transports: ['websocket', 'polling'],
@@ -127,16 +181,27 @@ export function useTelemetryStream({ defaultStationId = 'canal-junction' } = {})
     socket.on('connect', () => {
       setConnectionStatus('connected');
       setSocketId(socket.id);
-      subscribeToStation(selectedStationId);
+      if (!seriesManager.isHistoricalLocked) subscribeToStation(selectedStationRef.current);
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', reason => {
+      subscriptionVersion.current++;
+      if (!seriesManager.isHistoricalLocked) historyRequest.current?.abort();
       setConnectionStatus('disconnected');
+      if (reason === 'io server disconnect') void refreshUser();
     });
+
+    socket.on('connect_error', () => setConnectionStatus('disconnected'));
 
     // Ingest compacted batch packets
     socket.on('telemetry:batch', (batch) => {
-      seriesManager.ingestLive(batch);
+      if (!seriesManager.ingestLive(batch) && !historyRetry.current) {
+        historyRequest.current?.abort();
+        historyRetry.current = setTimeout(() => {
+          historyRetry.current = null;
+          if (!seriesManager.isHistoricalLocked) subscribeToStation(selectedStationRef.current);
+        }, 250);
+      }
     });
 
     // Fleet Summary updates
@@ -146,65 +211,68 @@ export function useTelemetryStream({ defaultStationId = 'canal-junction' } = {})
       }
     });
 
+    const incidentTimer = setInterval(() => void refreshIncidents(dashboardRequests.signal), 3000);
     return () => {
+      dashboardRequests.abort();
+      clearInterval(incidentTimer);
+      clearTimeout(reconnectTimer.current);
+      clearTimeout(historyRetry.current);
+      historyRetry.current = null;
+      historyRequest.current?.abort();
+      socket.removeAllListeners();
       socket.disconnect();
+      socketRef.current = null;
+      setConnectionStatus('disconnected');
     };
-  }, []);
+  }, [currentUser, refreshIncidents, refreshUser, seriesManager, subscribeToStation]);
 
   // Handle station change
   const selectStation = useCallback((newStationId) => {
-    if (newStationId === selectedStationId) return;
+    if (newStationId === selectedStationRef.current) return;
+    selectedStationRef.current = newStationId;
     setSelectedStationId(newStationId);
+    seriesManager.returnToLive();
     subscribeToStation(newStationId);
-  }, [selectedStationId, subscribeToStation]);
+  }, [seriesManager, subscribeToStation]);
 
   // Change window preset (1m, 5m, 15m, 1h)
   const setWindowPreset = useCallback((preset) => {
     seriesManager.setWindowPreset(preset);
     // Reload history to match new duration
-    if (socketRef.current?.connected) {
-      fetchAndMergeHistory(selectedStationId, seriesManager.cursorSeq, preset);
-    }
-  }, [seriesManager, selectedStationId, fetchAndMergeHistory]);
+    subscribeToStation(selectedStationRef.current);
+  }, [seriesManager, subscribeToStation]);
 
   // Historical Incident Replay
-  const openIncidentReplay = useCallback(async (incident) => {
+  const openIncidentReplay = useCallback((incident) => {
+    selectedStationRef.current = incident.stationId;
     setSelectedStationId(incident.stationId);
-    subscribeToStation(incident.stationId);
+    subscriptionVersion.current++;
+    if (socketRef.current?.connected) socketRef.current.emit('unsubscribe:station');
 
     const padMs = 60 * 1000;
     const from = incident.startTime - padMs;
     const to = (incident.endTime || Date.now()) + padMs;
 
     seriesManager.setHistoricalWindow(from, to);
+    seriesManager.startStationSubscription(incident.stationId, 0);
+    return fetchAndMergeHistory(incident.stationId, { from, to });
+  }, [seriesManager, fetchAndMergeHistory]);
 
-    try {
-      const url = `/api/stations/${incident.stationId}/history?from=${from}&to=${to}&maxPoints=800`;
-      const res = await fetch(url);
-      if (res.ok) {
-        const data = await res.json();
-        seriesManager.applyHistory(data.readings || []);
-      }
-    } catch (e) {
-      console.error('Failed to load incident history', e);
-    }
-  }, [seriesManager, subscribeToStation]);
-
-  const returnToLive = useCallback(() => {
+  const returnToLive = useCallback((stationId = selectedStationRef.current) => {
+    selectedStationRef.current = stationId;
+    setSelectedStationId(stationId);
     seriesManager.returnToLive();
-    subscribeToStation(selectedStationId);
-  }, [seriesManager, selectedStationId, subscribeToStation]);
+    subscribeToStation(stationId);
+  }, [seriesManager, subscribeToStation]);
 
   const shiftHistoricalWindow = useCallback((offsetMs) => {
     seriesManager.moveHistoricalWindow(offsetMs);
     if (seriesManager.historicalRange) {
       const { from, to } = seriesManager.historicalRange;
-      fetch(`/api/stations/${selectedStationId}/history?from=${from}&to=${to}&maxPoints=800`)
-        .then(r => r.json())
-        .then(data => seriesManager.applyHistory(data.readings || []))
-        .catch(console.error);
+      seriesManager.startStationSubscription(selectedStationRef.current, 0);
+      fetchAndMergeHistory(selectedStationRef.current, { from, to });
     }
-  }, [seriesManager, selectedStationId]);
+  }, [seriesManager, fetchAndMergeHistory]);
 
   // Trigger Fault
   const triggerFault = useCallback(async (stationId, type, durationSeconds = 60) => {
@@ -252,18 +320,14 @@ export function useTelemetryStream({ defaultStationId = 'canal-junction' } = {})
     }
   }, []);
 
-  // Export Incident CSV
-  const exportIncidentCsv = useCallback((incidentId) => {
-    window.open(`/api/incidents/${incidentId}/export`, '_blank');
-  }, []);
-
   // Diagnostic Test: Disconnect & Reconnect
   const testReconnect = useCallback(() => {
     const socket = socketRef.current;
     if (socket) {
+      clearTimeout(reconnectTimer.current);
       socket.disconnect();
       setConnectionStatus('disconnected');
-      setTimeout(() => {
+      reconnectTimer.current = setTimeout(() => {
         socket.connect();
       }, 1500);
     }
@@ -275,7 +339,11 @@ export function useTelemetryStream({ defaultStationId = 'canal-junction' } = {})
     connectionStatus,
     socketId,
     currentUser,
+    sessionChecked,
+    signIn,
+    signOut,
     seriesState,
+    historyError,
     fleetSummary,
     incidents,
     metricsSummary: seriesManager.getMetricsSummary(),
@@ -286,8 +354,7 @@ export function useTelemetryStream({ defaultStationId = 'canal-junction' } = {})
     triggerFault,
     clearFault,
     changeSimulatorRate,
-    exportIncidentCsv,
     testReconnect,
-    refreshIncidents
+    getLatestIncidents
   };
 }

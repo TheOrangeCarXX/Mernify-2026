@@ -6,12 +6,17 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { MongoClient } from 'mongodb';
 import { io as ClientIO } from 'socket.io-client';
 
 import { createServer } from '../server/index.mjs';
 import { AGENT_BEARER_KEY, createToken } from '../server/security.mjs';
 
-const TEST_MONGO_URI = process.env.TEST_MONGO_URI || 'mongodb://127.0.0.1:27017/floodline_integration_test';
+const databaseName = 'floodline_integration_' + randomUUID().replaceAll('-', '');
+const mongoUrl = new URL(process.env.TEST_MONGO_URI || process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/floodline');
+mongoUrl.pathname = '/' + databaseName;
+const TEST_MONGO_URI = mongoUrl.toString();
 const TEST_PORT = 3105;
 
 let serverCtx = null;
@@ -29,20 +34,16 @@ test.before(async () => {
     seedInitialHistory: false
   });
 
-  // Clean test database collections
-  await serverCtx.store.readingsCol.deleteMany({});
-  await serverCtx.store.stateCol.deleteMany({});
-  await serverCtx.store.incidentsCol.deleteMany({});
-
   await new Promise((resolve) => {
     serverCtx.server.listen(TEST_PORT, () => resolve());
   });
 });
 
 test.after(async () => {
-  if (serverCtx) {
-    await serverCtx.shutdown();
-  }
+  await serverCtx?.shutdown();
+  const mongo = new MongoClient(TEST_MONGO_URI);
+  try { await mongo.db(databaseName).dropDatabase(); }
+  finally { await mongo.close(); }
 });
 
 // 1. Role and Agent Access Control
@@ -96,8 +97,16 @@ test('1. Integration: Role and Agent Access Control', async () => {
 
 // 2. Station Room Isolation
 test('2. Integration: Station Room Isolation with Multiple Socket.IO Clients', async () => {
-  const clientA = ClientIO(serverBaseUrl, { transports: ['websocket'] });
-  const clientB = ClientIO(serverBaseUrl, { transports: ['websocket'] });
+  const unauthenticated = ClientIO(serverBaseUrl, { transports: ['websocket'], reconnection: false });
+  try {
+    const error = await new Promise(resolve => unauthenticated.once('connect_error', resolve));
+    assert.match(error.message, /session is required/);
+  } finally {
+    unauthenticated.disconnect();
+  }
+  const auth = { token: createToken({ username: 'viewer', role: 'viewer' }) };
+  const clientA = ClientIO(serverBaseUrl, { transports: ['websocket'], auth });
+  const clientB = ClientIO(serverBaseUrl, { transports: ['websocket'], auth });
 
   await Promise.all([
     new Promise(res => clientA.on('connect', res)),
@@ -260,7 +269,90 @@ test('5. Integration: Reconnect Backfill Retrieves Missed Readings through Curso
   assert.equal(matched.length, 5);
 });
 
+test('Bucketed history covers the whole requested window through the commit cursor', async () => {
+  const to = Date.now();
+  const from = to - 60_000;
+  const stationId = 'west-intake';
+  const makeReading = (index, timestamp, waterLevel) => ({
+    stationId,
+    eventId: 'bucket-proof-' + index + '-' + to,
+    timestamp,
+    metrics: { waterLevel, outflow: 350, vibration: 1.8, current: 55 }
+  });
+  const first = makeReading(0, from + 1000, 1.5);
+  const last = makeReading(1, to - 500, 4.2);
+  const [firstResult, secondResult] = await Promise.all([
+    serverCtx.store.enqueueBatch([first, first]),
+    serverCtx.store.enqueueBatch([last])
+  ]);
+  assert.equal(firstResult.stored, 1);
+  assert.equal(firstResult.duplicates, 1);
+  assert.equal(secondResult.stored, 1);
+  const query = new URLSearchParams({ from, to, beforeSeq: secondResult.latestSeq, maxPoints: 10, bucketMs: 6000 });
+  const response = await fetch(`${serverBaseUrl}/api/stations/${stationId}/history?${query}`, {
+    headers: { Authorization: 'Bearer ' + createToken({ username: 'viewer', role: 'viewer' }) }
+  });
+  assert.equal(response.status, 200);
+  const { readings } = await response.json();
+  assert.deepEqual(readings.map(reading => reading.severity), ['normal', 'critical']);
+  assert.ok(readings.at(-1).timestamp > from + 50_000);
+});
+
+test('Incident CSV exports raw readings beyond the chart row limit', async () => {
+  const incidentId = 'integration-complete-export';
+  const stationId = 'south-basin';
+  const startTime = Date.now() - 120_000;
+  const readings = Array.from({ length: 4101 }, (_, index) => ({
+    stationId, eventId: `csv-${startTime}-${index}`, timestamp: startTime + index,
+    metrics: { waterLevel: 1.6, outflow: 500, vibration: 1.8, current: 54 }
+  }));
+  const batches = [];
+  for (let start = 0; start < readings.length; start += 500) {
+    batches.push(serverCtx.store.enqueueBatch(readings.slice(start, start + 500)));
+  }
+  await Promise.all(batches);
+  await serverCtx.store.incidentsCol.insertOne({
+    incidentId, stationId, startTime, endTime: startTime + 4100, resolved: true
+  });
+  const token = createToken({ username: 'viewer', role: 'viewer' });
+  const response = await fetch(`${serverBaseUrl}/api/incidents/${incidentId}/export`, {
+    headers: { Authorization: 'Bearer ' + token }
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type'), /^text\/csv/);
+  const rows = (await response.text()).trimEnd().split('\n');
+  assert.equal(rows.length, readings.length + 1);
+  assert.ok(rows.at(-1).startsWith(String(startTime + 4100) + ','));
+});
+
 // 6. Persistence After Server Restart
+test('A database write failure settles ingest and permits a retry with the same ID', async () => {
+  const readings = serverCtx.store.readingsCol;
+  const insertMany = readings.insertMany;
+  const agent = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + AGENT_BEARER_KEY };
+  const event = {
+    stationId: 'harbor-gate', eventId: 'retry-after-write-failure', timestamp: Date.now(),
+    metrics: { waterLevel: 1.4, outflow: 600, vibration: 2, current: 55 }
+  };
+  const send = () => fetch(`${serverBaseUrl}/api/ingest`, {
+    method: 'POST', headers: agent, body: JSON.stringify(event), signal: AbortSignal.timeout(2000)
+  });
+  let failed;
+  try {
+    readings.insertMany = async () => { throw new Error('Test write interruption'); };
+    failed = await send();
+  } finally {
+    readings.insertMany = insertMany;
+  }
+  assert.equal(failed.status, 503);
+  assert.equal(serverCtx.store.getQueueLength(), 0);
+  assert.equal((await fetch(serverBaseUrl + '/api/health')).status, 503);
+  const retried = await send();
+  assert.equal(retried.status, 200);
+  assert.equal((await retried.json()).stored, 1);
+  assert.equal((await fetch(serverBaseUrl + '/api/health')).status, 200);
+});
+
 test('6. Integration: Server Restart Restores Latest Commit Sequence and Station States', async () => {
   const lastSeqBeforeRestart = serverCtx.store.getLatestSeq();
   assert.ok(lastSeqBeforeRestart > 0);

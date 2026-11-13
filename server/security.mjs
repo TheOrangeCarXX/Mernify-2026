@@ -2,6 +2,7 @@
  * Floodline - Security, Roles, Authentication, and Rate Limiting
  */
 
+import 'dotenv/config';
 import jwt from 'jsonwebtoken';
 
 export const JWT_SECRET = process.env.JWT_SECRET || 'floodline-stormwater-jwt-secret-key-2026';
@@ -10,17 +11,28 @@ export const AGENT_BEARER_KEY = process.env.AGENT_BEARER_KEY || 'floodline-agent
 export const USERS = [
   {
     username: 'operator',
-    password: 'operator123',
+    password: process.env.OPERATOR_PASSWORD || 'operator123',
     role: 'operator',
     displayName: 'Chief SCADA Operator'
   },
   {
     username: 'viewer',
-    password: 'viewer123',
+    password: process.env.VIEWER_PASSWORD || 'viewer123',
     role: 'viewer',
     displayName: 'Basin Monitor (Read Only)'
   }
 ];
+
+export function validateHostedCredentials(host) {
+  if (['127.0.0.1', 'localhost', '::1'].includes(host)) return;
+  if (process.env.DEMO_MODE !== 'false' ||
+      (process.env.JWT_SECRET?.length ?? 0) < 32 ||
+      (process.env.AGENT_BEARER_KEY?.length ?? 0) < 24 ||
+      USERS.some(user => user.password.length < 12) ||
+      USERS[0].password === USERS[1].password) {
+    throw new Error('Network binding requires DEMO_MODE=false, a 32-character JWT_SECRET, a 24-character AGENT_BEARER_KEY, and distinct 12-character operator and viewer passwords.');
+  }
+}
 
 export function createToken(payload, expiresIn = '12h') {
   return jwt.sign(payload, JWT_SECRET, { expiresIn });

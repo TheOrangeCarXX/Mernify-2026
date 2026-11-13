@@ -2,7 +2,7 @@
  * Floodline - Ingest Payload Validation & Sanitation
  */
 
-import { STATION_MAP } from '../shared/telemetry.mjs';
+import { MAX_FUTURE_SKEW_MS, RETENTION_MS, STATION_MAP } from '../shared/telemetry.mjs';
 
 export const MAX_BATCH_SIZE = 500;
 
@@ -26,22 +26,21 @@ export function validateEvent(item, index = 0) {
     };
   }
 
-  if (typeof eventId !== 'string' || eventId.trim() === '') {
-    return { valid: false, error: `Item [${index}]: eventId must be a non-empty string` };
+  if (typeof eventId !== 'string' || eventId.trim() === '' || eventId.length > 128) {
+    return { valid: false, error: `Item [${index}]: eventId must be a non-empty string up to 128 characters` };
   }
 
-  const ts = Number(timestamp);
-  if (!Number.isFinite(ts) || ts <= 0 || !Number.isInteger(ts)) {
+  const ts = timestamp;
+  if (!Number.isSafeInteger(ts) || ts <= 0) {
     return { valid: false, error: `Item [${index}]: timestamp must be a positive integer epoch millisecond` };
   }
 
-  // Reject absurdly skewed timestamps (e.g. > 10 minutes in future or older than 90 days)
   const now = Date.now();
-  if (ts > now + 10 * 60 * 1000) {
-    return { valid: false, error: `Item [${index}]: timestamp is more than 10 minutes in the future` };
+  if (ts > now + MAX_FUTURE_SKEW_MS) {
+    return { valid: false, error: `Item [${index}]: timestamp is more than 5 seconds in the future` };
   }
-  if (ts < now - 90 * 24 * 60 * 60 * 1000) {
-    return { valid: false, error: `Item [${index}]: timestamp is older than 90 days` };
+  if (ts < now - RETENTION_MS) {
+    return { valid: false, error: `Item [${index}]: timestamp is older than the 7-day retention window` };
   }
 
   if (!metrics || typeof metrics !== 'object') {
@@ -50,10 +49,10 @@ export function validateEvent(item, index = 0) {
 
   const { waterLevel, outflow, vibration, current } = metrics;
 
-  const wl = Number(waterLevel);
-  const of = Number(outflow);
-  const vb = Number(vibration);
-  const cur = Number(current);
+  const wl = waterLevel;
+  const of = outflow;
+  const vb = vibration;
+  const cur = current;
 
   if (!Number.isFinite(wl) || wl < 0 || wl > 50) {
     return { valid: false, error: `Item [${index}]: metrics.waterLevel must be a finite number between 0 and 50m` };
