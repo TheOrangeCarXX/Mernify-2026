@@ -1,0 +1,16 @@
+# Floodline 3:24 Demo Video Run of Show & Presentation Script
+
+This script matches Section 5 of `PLAN.md` and provides the exact narration and on-screen workflow for the hackathon demonstration video.
+
+---
+
+## Run of Show Table
+
+| Timestamp | Operator Action | Key Talking Points |
+|---|---|---|
+| **0:00–0:32** | Open the Floodline SCADA console (`http://localhost:3000`). Select a station on the interactive basin schematic, toggle between All Channels and single-metric focus, and change the time window (1m / 5m). | "Floodline is a real-time SCADA telemetry platform for six stormwater pump stations. Notice all six stations stream four key hydraulic and mechanical channels: water level, outflow, vibration, and current. The chart immediately boots with recent historical data from MongoDB." |
+| **0:32–1:10** | Open Canal Junction and East Sluice in side-by-side browser tabs. Click **Storm Surge** fault injection on Canal Junction. Observe Client 1 turn Critical with alert banner. Show Client 2 continues tracking East Sluice normally, but its fleet header displays the global critical alert. Switch Client 2 to Canal Junction. | "Under the hood, Socket.IO rooms isolate data streams. When we inject a storm surge at Canal Junction, water level surges above 3.8m. Client 1 immediately alarms with an overtopping warning. Client 2 follows East Sluice without wasted bandwidth, while receiving 1 Hz basin-wide health updates. Switching Client 2 seamlessly subscribes to the incident." |
+| **1:10–1:44** | Scroll to the **Incident Timeline** below the chart. Click the archived **Canal Junction Storm Surge** incident. Use the **Earlier** and **Later** buttons to scrub through the incident. Click **Return to Live**. | "Every alert episode is indexed in MongoDB. Clicking an incident locks the viewport to that exact historical window. Notice the simulator continues running in the background, but the chart is frozen on the historical episode for investigation. Clicking 'Return to Live' resumes rolling real-time monitoring." |
+| **1:44–2:18** | Click the **Diagnostics** button in the header. Click **Test Reconnect**. Observe the socket disconnect and reconnect, and watch the sequence cursor gap backfill. | "Here we demonstrate our monotonic cursor handshake. When a client reconnects, it retrieves its committed cursor sequence from the subscription acknowledgment, fetches missing MongoDB readings up to that sequence, and applies buffered live updates. There are zero duplicate points or gaps." |
+| **2:18–2:53** | Show the benchmark report in the terminal: `npm run bench -- --rate=3000 --seconds=30 --clients=48`. Point out the 3,000 readings/s sustained rate and 183ms p95 latency. | "To prove scalability, our benchmark ran 48 concurrent Socket.IO clients receiving 720,000 deliveries at 3,000 readings per second with a p95 latency of just 183 ms. Our 100ms batch flush, compact wire encoding, and 4 Hz client rendering throttle prevent CPU saturation." |
+| **2:53–3:24** | Show the role badge in the top bar (Operator vs. Viewer), explain rate limiting and input validation, and show the responsive 390px mobile view. | "Floodline implements role-based access control with JWT and Agent Bearer keys, rate limiting with token buckets, and full mobile responsiveness for on-call field operators. Thank you!" |
