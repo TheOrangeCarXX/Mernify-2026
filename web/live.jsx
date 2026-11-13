@@ -238,6 +238,25 @@ export function useTelemetryStream({ defaultStationId = 'canal-junction' } = {})
     }
   }, [refreshIncidents]);
 
+  // Adjust simulator throughput rate
+  const changeSimulatorRate = useCallback(async (rate) => {
+    try {
+      const res = await fetch('/api/simulator/rate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rate })
+      });
+      return await res.json();
+    } catch (e) {
+      console.error('Failed to change simulator rate', e);
+    }
+  }, []);
+
+  // Export Incident CSV
+  const exportIncidentCsv = useCallback((incidentId) => {
+    window.open(`/api/incidents/${incidentId}/export`, '_blank');
+  }, []);
+
   // Diagnostic Test: Disconnect & Reconnect
   const testReconnect = useCallback(() => {
     const socket = socketRef.current;
@@ -266,6 +285,8 @@ export function useTelemetryStream({ defaultStationId = 'canal-junction' } = {})
     shiftHistoricalWindow,
     triggerFault,
     clearFault,
+    changeSimulatorRate,
+    exportIncidentCsv,
     testReconnect,
     refreshIncidents
   };

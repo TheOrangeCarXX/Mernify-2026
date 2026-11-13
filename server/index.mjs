@@ -326,6 +326,60 @@ export async function createServer({
     }
   });
 
+  // Export Incident Telemetry: GET /api/incidents/:incidentId/export
+  app.get('/api/incidents/:incidentId/export', authenticate, async (req, res) => {
+    const { incidentId } = req.params;
+    try {
+      const incident = await store.incidentsCol.findOne({ incidentId });
+      if (!incident) {
+        return res.status(404).json({ error: 'Incident not found' });
+      }
+
+      const padMs = 60 * 1000;
+      const from = incident.startTime - padMs;
+      const to = (incident.endTime || Date.now()) + padMs;
+
+      const readings = await store.getStationHistory(incident.stationId, {
+        from,
+        to,
+        maxPoints: 2000
+      });
+
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${incidentId}.csv"`);
+
+      let csv = 'timestamp,iso_time,station_id,sequence,water_level_m,outflow_lps,vibration_mms,current_amps,severity,anomaly_reason\n';
+      for (const r of readings) {
+        const iso = new Date(r.timestamp).toISOString();
+        csv += `${r.timestamp},"${iso}","${r.stationId}",${r.seq},${r.metrics.waterLevel},${r.metrics.outflow},${r.metrics.vibration},${r.metrics.current},"${r.severity}","${r.anomalyReason.replace(/"/g, '""')}"\n`;
+      }
+
+      res.send(csv);
+    } catch (err) {
+      console.error('[Export Error]', err);
+      res.status(500).json({ error: 'Failed to export incident data' });
+    }
+  });
+
+  // Simulator Rate Control: POST /api/simulator/rate
+  app.post('/api/simulator/rate', authenticate, requireRole('operator'), (req, res) => {
+    if (!simulator) {
+      return res.status(400).json({ error: 'Simulator is not active on this server' });
+    }
+    const { rate } = req.body || {};
+    const targetRate = Number(rate);
+    if (!Number.isFinite(targetRate) || targetRate < 6 || targetRate > 10000) {
+      return res.status(400).json({ error: 'Simulator rate must be a number between 6 and 10000 readings/s' });
+    }
+
+    simulator.setRate(targetRate);
+    res.json({
+      success: true,
+      rate: simulator.targetRate,
+      message: `Simulator rate updated to ${simulator.targetRate} readings/second`
+    });
+  });
+
   // Fault Injections: POST /api/faults/trigger
   app.post('/api/faults/trigger', authenticate, requireRole('operator'), (req, res) => {
     if (!simulator) {
