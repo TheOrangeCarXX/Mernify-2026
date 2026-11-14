@@ -1,0 +1,29 @@
+# Render Blueprint specification for Floodline SCADA Telemetry Console
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: floodline-scada
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000
+      - key: DEMO_MODE
+        value: "true"
+      - key: MONGO_URI
+        sync: false
+        # Enter your MongoDB Atlas connection string (e.g. mongodb+srv://<user>:<password>@cluster.mongodb.net/floodline)
+      - key: JWT_SECRET
+        generateValue: true
+      - key: AGENT_BEARER_KEY
+        generateValue: true

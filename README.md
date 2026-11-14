@@ -85,7 +85,13 @@ flowchart LR
 
 ## Quick Start & Setup
 
-### Prerequisites
+### Deploy to Render (Cloud Blueprint)
+Floodline includes a native [`render.yaml`](render.yaml) blueprint specification for 1-click cloud deployment:
+1. Connect your repository to [Render Blueprints](https://dashboard.render.com/blueprints).
+2. Render automatically provisions the web service, builds Vite assets, and binds the Socket.IO cluster.
+3. Supply your `MONGO_URI` (MongoDB Atlas URI).
+
+### Local Prerequisites
 - Node.js >= 20.x (Node 25 recommended)
 - MongoDB Server running locally on `localhost:27017` (or via Docker)
 
