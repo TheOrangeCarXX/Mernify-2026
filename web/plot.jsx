@@ -1,18 +1,18 @@
 /**
  * Floodline - High-Performance Real-Time Canvas Telemetry Plot
- * Renders multiple hydraulic and mechanical telemetry channels with warning/critical threshold lines,
- * incident anomaly highlights, and interactive crosshair scrubbing.
+ * Industrial SCADA Historian & Oscilloscope Canvas Panel
+ * Renders hydraulic & mechanical channels with threshold alarm lines,
+ * anomaly region shading, and precision crosshair scrubbing.
  */
 
 import React, { useRef, useEffect, useState } from 'react';
-import { Play, SkipBack, SkipForward, Maximize2, Activity } from 'lucide-react';
+import { Play, SkipBack, SkipForward, Activity, Clock } from 'lucide-react';
 
 const METRIC_CONFIG = {
   waterLevel: {
     label: 'Water Level',
     unit: 'm',
-    color: '#00e5ff',
-    bg: 'rgba(0, 229, 255, 0.1)',
+    color: '#38bdf8', // Industrial Sky Blue
     min: 0,
     max: 5.0,
     warning: 3.0,
@@ -21,8 +21,7 @@ const METRIC_CONFIG = {
   outflow: {
     label: 'Discharge Outflow',
     unit: 'L/s',
-    color: '#10b981',
-    bg: 'rgba(16, 185, 129, 0.1)',
+    color: '#10b981', // Industrial Emerald
     min: 0,
     max: 1800,
     warning: 200,
@@ -31,8 +30,7 @@ const METRIC_CONFIG = {
   vibration: {
     label: 'Pump Vibration (RMS)',
     unit: 'mm/s',
-    color: '#f59e0b',
-    bg: 'rgba(245, 158, 11, 0.1)',
+    color: '#f59e0b', // Safety Amber
     min: 0,
     max: 12.0,
     warning: 4.5,
@@ -41,8 +39,7 @@ const METRIC_CONFIG = {
   current: {
     label: 'Motor Current',
     unit: 'A',
-    color: '#a855f7',
-    bg: 'rgba(168, 85, 247, 0.1)',
+    color: '#c084fc', // Telemetry Violet
     min: 0,
     max: 130,
     warning: 85,
@@ -98,33 +95,33 @@ export function TelemetryPlot({
     const w = size.width;
     const h = size.height;
 
-    // Background
-    ctx.fillStyle = '#0a0f18';
+    // Technical Oscilloscope Background
+    ctx.fillStyle = '#070b12';
     ctx.fillRect(0, 0, w, h);
 
     if (!points || points.length === 0) {
-      ctx.fillStyle = '#475569';
-      ctx.font = '14px "JetBrains Mono", monospace';
+      ctx.fillStyle = '#64748b';
+      ctx.font = '13px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('Waiting for telemetry…', w / 2, h / 2);
+      ctx.fillText('AWAITING TELEMETRY STREAM…', w / 2, h / 2);
       return;
     }
 
-    const padding = { top: 35, right: 25, bottom: 35, left: 55 };
+    const padding = { top: 32, right: 24, bottom: 32, left: 54 };
     const plotW = w - padding.left - padding.right;
     const plotH = h - padding.top - padding.bottom;
 
     const minTime = historicalRange?.from ?? points[0].timestamp;
     const maxTime = historicalRange?.to ?? Math.max(points[points.length - 1].timestamp, minTime + 1000);
 
-    // Draw Grid Lines
-    ctx.strokeStyle = '#1e293b';
+    // Grid lines (Crisp 1px industrial grid)
+    ctx.strokeStyle = '#172033';
     ctx.lineWidth = 1;
-    ctx.setLineDash([3, 3]);
+    ctx.setLineDash([2, 2]);
 
-    const numGridY = 5;
+    const numGridY = 4;
     for (let i = 0; i <= numGridY; i++) {
-      const y = padding.top + (plotH / numGridY) * i;
+      const y = Math.round(padding.top + (plotH / numGridY) * i) + 0.5;
       ctx.beginPath();
       ctx.moveTo(padding.left, y);
       ctx.lineTo(w - padding.right, y);
@@ -133,7 +130,7 @@ export function TelemetryPlot({
 
     const numGridX = w < 520 ? 3 : 6;
     for (let i = 0; i <= numGridX; i++) {
-      const x = padding.left + (plotW / numGridX) * i;
+      const x = Math.round(padding.left + (plotW / numGridX) * i) + 0.5;
       ctx.beginPath();
       ctx.moveTo(x, padding.top);
       ctx.lineTo(x, h - padding.bottom);
@@ -155,7 +152,7 @@ export function TelemetryPlot({
         const x1 = padding.left + ((p.timestamp - minTime) / (maxTime - minTime)) * plotW;
         const next = points[i + 1]?.timestamp ?? p.timestamp;
         const x2 = padding.left + ((next - minTime) / (maxTime - minTime)) * plotW;
-        ctx.fillStyle = p.severity === 'critical' ? 'rgba(239, 68, 68, 0.18)' : 'rgba(245, 158, 11, 0.12)';
+        ctx.fillStyle = p.severity === 'critical' ? 'rgba(239, 68, 68, 0.16)' : 'rgba(245, 158, 11, 0.10)';
         ctx.fillRect(x1, padding.top, Math.max(2, x2 - x1), plotH);
       }
     }
@@ -173,12 +170,11 @@ export function TelemetryPlot({
 
       // Draw Threshold Lines if single metric selected
       if (activeMetric !== 'all') {
-        // Warning threshold line
         if (stationWarn != null) {
           const yWarn = padding.top + plotH - ((stationWarn - cfg.min) / (cfg.max - cfg.min)) * plotH;
           if (yWarn >= padding.top && yWarn <= padding.top + plotH) {
             ctx.strokeStyle = '#f59e0b';
-            ctx.setLineDash([5, 5]);
+            ctx.setLineDash([4, 4]);
             ctx.beginPath();
             ctx.moveTo(padding.left, yWarn);
             ctx.lineTo(w - padding.right, yWarn);
@@ -186,16 +182,15 @@ export function TelemetryPlot({
             ctx.fillStyle = '#f59e0b';
             ctx.font = '10px monospace';
             ctx.textAlign = 'right';
-            ctx.fillText(`WARN ${stationWarn} ${cfg.unit}`, w - padding.right - 5, yWarn - 4);
+            ctx.fillText(`WARN ${stationWarn} ${cfg.unit}`, w - padding.right - 6, yWarn - 4);
           }
         }
 
-        // Critical threshold line
         if (stationCrit != null) {
           const yCrit = padding.top + plotH - ((stationCrit - cfg.min) / (cfg.max - cfg.min)) * plotH;
           if (yCrit >= padding.top && yCrit <= padding.top + plotH) {
             ctx.strokeStyle = '#ef4444';
-            ctx.setLineDash([5, 5]);
+            ctx.setLineDash([4, 4]);
             ctx.beginPath();
             ctx.moveTo(padding.left, yCrit);
             ctx.lineTo(w - padding.right, yCrit);
@@ -203,16 +198,16 @@ export function TelemetryPlot({
             ctx.fillStyle = '#ef4444';
             ctx.font = '10px monospace';
             ctx.textAlign = 'right';
-            ctx.fillText(`CRIT ${stationCrit} ${cfg.unit}`, w - padding.right - 5, yCrit - 4);
+            ctx.fillText(`CRIT ${stationCrit} ${cfg.unit}`, w - padding.right - 6, yCrit - 4);
           }
         }
         ctx.setLineDash([]);
       }
 
-      // Plot curve
+      // Min/Max envelope band for aggregate windows
       if (activeMetric === metricKey) {
         ctx.strokeStyle = cfg.color;
-        ctx.globalAlpha = 0.22;
+        ctx.globalAlpha = 0.20;
         ctx.lineWidth = 1;
         ctx.beginPath();
         for (const point of points) {
@@ -224,8 +219,10 @@ export function TelemetryPlot({
         ctx.stroke();
         ctx.globalAlpha = 1;
       }
+
+      // Primary trace line
       ctx.strokeStyle = cfg.color;
-      ctx.lineWidth = activeMetric === metricKey ? 2.5 : 1.5;
+      ctx.lineWidth = activeMetric === metricKey ? 2 : 1.5;
       ctx.beginPath();
 
       for (let i = 0; i < points.length; i++) {
@@ -240,7 +237,7 @@ export function TelemetryPlot({
       }
       ctx.stroke();
 
-      // Axis labels on left
+      // Axis ticks on left
       if (activeMetric === metricKey) {
         ctx.fillStyle = cfg.color;
         ctx.font = '10px monospace';
@@ -253,11 +250,10 @@ export function TelemetryPlot({
       }
     });
 
-    // Crosshair scrubber if mouse is hovering
+    // Crosshair scrubber
     if (hoveredData && hoveredData.point) {
       const hx = padding.left + ((hoveredData.point.timestamp - minTime) / (maxTime - minTime)) * plotW;
-
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+      ctx.strokeStyle = '#94a3b8';
       ctx.setLineDash([2, 2]);
       ctx.beginPath();
       ctx.moveTo(hx, padding.top);
@@ -267,15 +263,14 @@ export function TelemetryPlot({
     }
   }, [points, activeMetric, station, hoveredData, size, historicalRange]);
 
-  // Handle Mouse Hover Scrubbing
   const handleMouseMove = (e) => {
     const canvas = canvasRef.current;
     if (!canvas || !points || points.length === 0) return;
 
     const rect = canvas.getBoundingClientRect();
     const mouseX = e.clientX - rect.left;
-    const paddingLeft = 55;
-    const paddingRight = 25;
+    const paddingLeft = 54;
+    const paddingRight = 24;
     const plotW = rect.width - paddingLeft - paddingRight;
 
     if (mouseX < paddingLeft || mouseX > rect.width - paddingRight) {
@@ -288,7 +283,6 @@ export function TelemetryPlot({
     const timeRatio = (mouseX - paddingLeft) / plotW;
     const targetTime = minTime + timeRatio * (maxTime - minTime);
 
-    // Find closest data point
     let closest = points[0];
     let minDiff = Math.abs(closest.timestamp - targetTime);
 
@@ -308,17 +302,17 @@ export function TelemetryPlot({
   };
 
   return (
-    <div className="flex flex-col bg-slate-900/90 border border-slate-800 rounded-lg overflow-hidden shadow-xl" ref={containerRef}>
+    <div className="flex flex-col bg-[#0b101b] border border-[#1e293b] rounded shadow-md overflow-hidden" ref={containerRef}>
       {/* Chart Control Toolbar */}
-      <div className="flex flex-wrap items-center justify-between px-4 py-2.5 bg-slate-950/70 border-b border-slate-800 gap-2">
+      <div className="flex flex-wrap items-center justify-between px-3.5 py-2 bg-[#0e1422] border-b border-[#1e293b] gap-2">
         {/* Metric Selector Tabs */}
-        <div className="flex items-center gap-1.5 bg-slate-900 p-1 rounded-md border border-slate-800">
+        <div className="flex items-center gap-1 bg-[#070b12] p-0.5 rounded border border-[#1e293b]">
           <button
             onClick={() => onMetricChange('all')}
-            className={`px-2.5 py-1 text-xs font-semibold rounded transition ${
+            className={`px-2.5 py-1 text-xs font-mono font-medium rounded transition ${
               activeMetric === 'all'
-                ? 'bg-blue-600 text-white shadow'
-                : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                ? 'bg-[#1e293b] text-white border border-slate-600'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-[#131b2e]'
             }`}
           >
             All Channels
@@ -327,9 +321,9 @@ export function TelemetryPlot({
             <button
               key={key}
               onClick={() => onMetricChange(key)}
-              style={{ color: activeMetric === key ? '#fff' : cfg.color }}
-              className={`px-2.5 py-1 text-xs font-semibold rounded transition ${
-                activeMetric === key ? 'bg-slate-800 shadow border border-slate-700' : 'hover:bg-slate-800/60'
+              style={{ color: activeMetric === key ? '#ffffff' : cfg.color }}
+              className={`px-2.5 py-1 text-xs font-mono font-medium rounded transition ${
+                activeMetric === key ? 'bg-[#1e293b] border border-slate-600 shadow-sm' : 'hover:bg-[#131b2e]'
               }`}
             >
               {cfg.label.split(' ')[0]}
@@ -340,26 +334,26 @@ export function TelemetryPlot({
         {/* Time Window & Historical Controls */}
         <div className="flex flex-wrap items-center gap-2">
           {isHistoricalLocked && (
-            <div className="flex items-center gap-1.5 bg-amber-500/20 text-amber-300 border border-amber-500/40 px-2 py-0.5 rounded text-xs">
-              <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
-              <span className="font-mono font-medium">HISTORICAL REPLAY</span>
+            <div className="flex items-center gap-1.5 bg-amber-950/80 text-amber-300 border border-amber-700/80 px-2 py-0.5 rounded text-xs">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>
+              <span className="font-mono font-bold tracking-tight">HISTORICAL REPLAY</span>
               <button
                 onClick={() => onShiftWindow(-60000)}
                 title="Step earlier by 1m"
-                className="p-1 hover:bg-amber-500/30 rounded"
+                className="p-1 hover:bg-amber-800/60 rounded"
               >
-                <SkipBack className="w-3.5 h-3.5" />
+                <SkipBack className="w-3 h-3" />
               </button>
               <button
                 onClick={() => onShiftWindow(60000)}
                 title="Step later by 1m"
-                className="p-1 hover:bg-amber-500/30 rounded"
+                className="p-1 hover:bg-amber-800/60 rounded"
               >
-                <SkipForward className="w-3.5 h-3.5" />
+                <SkipForward className="w-3 h-3" />
               </button>
               <button
                 onClick={() => onReturnToLive()}
-                className="ml-1 bg-amber-600 hover:bg-amber-500 text-white px-2 py-0.5 rounded text-xs font-semibold transition"
+                className="ml-1 bg-amber-600 hover:bg-amber-500 text-slate-950 px-2 py-0.5 rounded text-xs font-mono font-bold transition"
               >
                 Return to Live
               </button>
@@ -367,15 +361,15 @@ export function TelemetryPlot({
           )}
 
           {/* Time Window Buttons */}
-          <div className="flex items-center gap-1 bg-slate-900 p-1 rounded-md border border-slate-800">
+          <div className="flex items-center gap-0.5 bg-[#070b12] p-0.5 rounded border border-[#1e293b]">
             {['1m', '5m', '15m', '1h'].map(preset => (
               <button
                 key={preset}
                 onClick={() => onWindowPresetChange(preset)}
                 className={`px-2 py-0.5 text-xs font-mono font-medium rounded transition ${
                   windowPreset === preset && !isHistoricalLocked
-                    ? 'bg-cyan-600 text-white'
-                    : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                    ? 'bg-[#0284c7] text-white font-bold'
+                    : 'text-slate-400 hover:text-white hover:bg-[#131b2e]'
                 }`}
               >
                 {preset}
@@ -397,32 +391,32 @@ export function TelemetryPlot({
         {/* Hover Readout Tooltip */}
         {hoveredData && hoveredData.point && (
           <div
-            className="absolute top-3 pointer-events-none bg-slate-950/95 border border-cyan-500/60 p-2.5 rounded-lg shadow-2xl backdrop-blur text-xs z-20 font-mono"
+            className="absolute top-2.5 pointer-events-none bg-[#090d16]/95 border border-[#334155] p-2.5 rounded shadow-xl backdrop-blur-sm text-xs z-20 font-mono"
             style={{
               left: Math.min(Math.max(hoveredData.x - 100, 15), canvasRef.current?.clientWidth - 220 || 300)
             }}
           >
-            <div className="text-slate-400 text-[11px] mb-1 pb-1 border-b border-slate-800 flex justify-between gap-4">
+            <div className="text-slate-400 text-[10px] mb-1 pb-1 border-b border-[#1e293b] flex justify-between gap-4">
               <span>{new Date(hoveredData.point.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 })}</span>
-              <span className="text-slate-500">Seq #{hoveredData.point.seq}</span>
+              <span className="text-slate-500">SEQ #{hoveredData.point.seq}</span>
             </div>
-            <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-              <div className="text-cyan-400">
+            <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 tabular-nums">
+              <div className="text-[#38bdf8]">
                 Level: <span className="font-bold">{hoveredData.point.metrics?.waterLevel?.toFixed(2)} m</span>
               </div>
-              <div className="text-emerald-400">
+              <div className="text-[#10b981]">
                 Flow: <span className="font-bold">{hoveredData.point.metrics?.outflow?.toFixed(0)} L/s</span>
               </div>
-              <div className="text-amber-400">
+              <div className="text-[#f59e0b]">
                 Vib: <span className="font-bold">{hoveredData.point.metrics?.vibration?.toFixed(2)} mm/s</span>
               </div>
-              <div className="text-purple-400">
+              <div className="text-[#c084fc]">
                 Current: <span className="font-bold">{hoveredData.point.metrics?.current?.toFixed(1)} A</span>
               </div>
             </div>
             {hoveredData.point.anomalyReason && hoveredData.point.anomalyReason !== 'Nominal operating conditions' && (
-              <div className="mt-1.5 pt-1 border-t border-slate-800 text-[11px] text-amber-300 font-sans">
-                ⚠ {hoveredData.point.anomalyReason}
+              <div className="mt-1 pt-1 border-t border-[#1e293b] text-[10px] text-amber-300">
+                STATUS: {hoveredData.point.anomalyReason}
               </div>
             )}
           </div>
@@ -430,27 +424,27 @@ export function TelemetryPlot({
       </div>
 
       {/* Legend / Status Bar */}
-      <div className="flex flex-wrap items-center justify-between px-4 py-2 bg-slate-950/90 border-t border-slate-800/80 text-xs text-slate-400 font-mono">
+      <div className="flex flex-wrap items-center justify-between px-3.5 py-1.5 bg-[#0e1422] border-t border-[#1e293b] text-[11px] text-slate-400 font-mono">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
           <span className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-cyan-400"></span>
+            <span className="w-2 h-2 rounded-sm bg-[#38bdf8]"></span>
             Water Level (m)
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
+            <span className="w-2 h-2 rounded-sm bg-[#10b981]"></span>
             Outflow (L/s)
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-amber-400"></span>
+            <span className="w-2 h-2 rounded-sm bg-[#f59e0b]"></span>
             Vibration (mm/s)
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-purple-400"></span>
+            <span className="w-2 h-2 rounded-sm bg-[#c084fc]"></span>
             Current (A)
           </span>
         </div>
-        <div className="text-slate-500">
-          {points.reduce((count, point) => count + (point.count ?? 1), 0).toLocaleString()} readings · {points.length} plotted points
+        <div className="text-slate-500 tabular-nums">
+          {points.reduce((count, point) => count + (point.count ?? 1), 0).toLocaleString()} readings · {points.length} points
         </div>
       </div>
     </div>
