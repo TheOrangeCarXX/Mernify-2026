@@ -260,7 +260,7 @@ export function FloodlineApp() {
   if (sessionChecked && !currentUser) return <SignIn onSignIn={signIn} />;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-slate-950">
+    <div className="min-h-screen max-w-full overflow-x-hidden bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-slate-950">
       {/* 1. Header Toolbar */}
       <header className="bg-slate-900 border-b border-slate-800 px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 sticky top-0 z-40 backdrop-blur shadow-md">
         <div className="flex items-center gap-3">
@@ -985,11 +985,11 @@ export function FloodlineApp() {
       )}
 
       {/* Footer */}
-      <footer className="bg-slate-950 border-t border-slate-800/80 px-4 py-2.5 text-xs text-slate-500 flex flex-wrap items-center justify-between gap-2 font-mono">
-        <div>
+      <footer className="bg-slate-950 border-t border-slate-800/80 px-4 py-2.5 text-xs text-slate-500 flex flex-wrap items-center justify-between gap-2 font-mono break-words overflow-hidden">
+        <div className="break-words">
           FLOODLINE SCADA Telemetry Console • MERN Stack & Socket.IO Telemetry
         </div>
-        <div>
+        <div className="break-words">
           MongoDB Community 8.0 • 6 Distributed Stations • Monotonic Cursor Handshake
         </div>
       </footer>
