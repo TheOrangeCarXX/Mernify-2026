@@ -352,11 +352,11 @@ export function FloodlineApp() {
           {/* Diagnostics Button */}
           <button
             onClick={() => setShowDiagnostics(true)}
-            className="flex items-center gap-1.5 px-2 py-1 rounded bg-[#101726] hover:bg-[#162238] text-xs font-mono border border-[#1e293b] transition"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#101726] hover:bg-[#162238] text-xs font-mono border border-sky-500/30 text-sky-300 transition"
             title="Stream Diagnostics & Connection Simulation"
           >
-            <Activity className="w-3.5 h-3.5 text-slate-400" />
-            <span className="hidden lg:inline">Diagnostics</span>
+            <Activity className="w-3.5 h-3.5 text-sky-400" />
+            <span className="font-semibold">Diagnostics</span>
           </button>
         </div>
       </header>
