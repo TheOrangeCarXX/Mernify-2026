@@ -126,7 +126,7 @@ Open **`http://localhost:3000`** in your browser.
 
 Run `npm run browser-check` after building to verify station isolation, faults, replay, reconnect, and the 390px dashboard in Edge or Chrome. The browser check and benchmark use temporary databases. Use `MONGO_URI` to select your MongoDB instance.
 
-For the live demo, open [Canal Junction](http://localhost:3000/?station=canal-junction) and [East Sluice](http://localhost:3000/?station=east-sluice) in two windows. Trigger **Storm Surge** at Canal Junction. East Sluice keeps its own chart while the fleet counter registers the critical station. Use **Replay** to review the incident and **CSV** to download raw readings. Use **Diagnostics → Test Reconnect** to show history recovering after a disconnect. Watch the [3:24 demo](docs/floodline-demo.mp4) or follow the [demo script](docs/demo-script.md).
+For the live demo, open [Canal Junction](http://localhost:3000/?station=canal-junction) and [East Sluice](http://localhost:3000/?station=east-sluice) in two windows. Trigger **Storm Surge** at Canal Junction. East Sluice keeps its own chart while the fleet counter registers the critical station. Use **Replay** to review the incident and **CSV** to download raw readings. Use **Diagnostics → Test Reconnect** to show history recovering after a disconnect. Watch the [YouTube Video Walkthrough](https://youtu.be/fHE2_kdWtQ8) or the [GitHub Demo Video](docs/floodline-demo.mp4), or follow the [demo script](docs/demo-script.md).
 
 
 ---
