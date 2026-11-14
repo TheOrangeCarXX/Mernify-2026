@@ -1,7 +1,11 @@
 # Floodline: Real-Time SCADA Stormwater Telemetry Platform
 
 > **MERNIFY Hackathon 2026** — *High-Throughput Streams & Telemetry Track*  
-> Built with **MongoDB, Express.js, React.js, Node.js, and Socket.IO**.
+> Built with **MongoDB Atlas, Express.js, React.js, Node.js, and Socket.IO**.
+
+[![Live Cloud Deployment](https://img.shields.io/badge/Live%20Demo-Render%20Cloud-00E599?style=for-the-badge&logo=render&logoColor=white)](https://floodline-scada-bi5i.onrender.com)
+[![YouTube Video Demo](https://img.shields.io/badge/YouTube-Video%20Walkthrough-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtu.be/fHE2_kdWtQ8)
+[![Database](https://img.shields.io/badge/Database-MongoDB%20Atlas-47A248?style=for-the-badge&logo=mongodb&logoColor=white)](https://www.mongodb.com/cloud/atlas)
 
 [![Unit Tests](https://img.shields.io/badge/Unit%20Tests-7%2F7%20Passed-emerald.svg)](test/unit.test.mjs)
 [![Integration Tests](https://img.shields.io/badge/Integration%20Tests-9%2F9%20Passed-emerald.svg)](test/integration.test.mjs)
@@ -9,6 +13,18 @@
 [![Throughput](https://img.shields.io/badge/Benchmark-5%2C000%20readings%2Fs%20(0%20drops)-blue.svg)](docs/benchmark.md)
 [![Stack](https://img.shields.io/badge/Stack-MERN%20%2B%20Socket.IO%204-cyan.svg)](https://socket.io/)
 [![HMI Standard](https://img.shields.io/badge/HMI%20Ergonomics-ISA--101%20SCADA-blueviolet.svg)](web/)
+
+---
+
+## 🚀 Live Demo & Links
+
+- **Live Cloud Application**: [https://floodline-scada-bi5i.onrender.com](https://floodline-scada-bi5i.onrender.com)
+- **Live Health Endpoint**: [https://floodline-scada-bi5i.onrender.com/api/health](https://floodline-scada-bi5i.onrender.com/api/health)
+- **YouTube Walkthrough Video**: [https://youtu.be/fHE2_kdWtQ8](https://youtu.be/fHE2_kdWtQ8)
+- **In-Repository HD Demo Video**: [docs/floodline-demo.mp4](docs/floodline-demo.mp4)
+- **GitHub Repository**: [https://github.com/TheOrangeCarXX/Mernify-2026](https://github.com/TheOrangeCarXX/Mernify-2026)
+
+---
 
 Floodline is a real-time telemetry monitoring console and supervisory control system engineered for six distributed stormwater pump stations. When severe weather hits, operators must immediately identify which pump station is in distress, distinguish rising retention basin levels (flooding risk) from pump mechanical faults (vibration/motor current overload), and review historical incident progression without interrupting live surveillance.
 
@@ -132,7 +148,7 @@ Open **`http://localhost:3000`** in your browser.
 
 Run `npm run browser-check` after building to verify station isolation, faults, replay, reconnect, and the 390px dashboard in Edge or Chrome. The browser check and benchmark use temporary databases. Use `MONGO_URI` to select your MongoDB instance.
 
-For the live demo, open [Canal Junction](http://localhost:3000/?station=canal-junction) and [East Sluice](http://localhost:3000/?station=east-sluice) in two windows. Trigger **Storm Surge** at Canal Junction. East Sluice keeps its own chart while the fleet counter registers the critical station. Use **Replay** to review the incident and **CSV** to download raw readings. Use **Diagnostics → Test Reconnect** to show history recovering after a disconnect. Watch the [YouTube Video Walkthrough](https://youtu.be/fHE2_kdWtQ8) or the [GitHub Demo Video](docs/floodline-demo.mp4), or follow the [demo script](docs/demo-script.md).
+For the live demo, test directly on the live hosted cloud instance at [https://floodline-scada-bi5i.onrender.com](https://floodline-scada-bi5i.onrender.com) or locally: open [Canal Junction](http://localhost:3000/?station=canal-junction) and [East Sluice](http://localhost:3000/?station=east-sluice) in two windows. Trigger **Storm Surge** at Canal Junction. East Sluice keeps its own chart while the fleet counter registers the critical station. Use **Replay** to review the incident and **CSV** to download raw readings. Use **Diagnostics → Test Reconnect** to show history recovering after a disconnect. Watch the [YouTube Video Walkthrough](https://youtu.be/fHE2_kdWtQ8) or the [GitHub Demo Video](docs/floodline-demo.mp4), or follow the [demo script](docs/demo-script.md).
 
 
 ---
